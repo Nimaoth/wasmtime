@@ -54,5 +54,6 @@ threads = ["wasmtime/threads"]
 gc = ["wasmtime/gc"]
 cranelift = ['wasmtime/cranelift']
 winch = ['wasmtime/winch']
+component-model = ["wasmtime/component-model"]
 # ... if you add a line above this be sure to change the other locations
 # marked WASMTIME_FEATURE_LIST

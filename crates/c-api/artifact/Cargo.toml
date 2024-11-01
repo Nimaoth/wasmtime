@@ -35,6 +35,7 @@ default = [
   'gc',
   'cranelift',
   'winch',
+  'component-model',
   # ... if you add a line above this be sure to change the other locations
   # marked WASMTIME_FEATURE_LIST
 ]
@@ -53,5 +54,6 @@ threads = ["wasmtime-c-api/threads"]
 gc = ["wasmtime-c-api/gc"]
 cranelift = ["wasmtime-c-api/cranelift"]
 winch = ["wasmtime-c-api/winch"]
+component-model = ["wasmtime-c-api/component-model"]
 # ... if you add a line above this be sure to read the comment at the end of
 # `default`
