@@ -493,7 +493,6 @@ unsafe fn c_callback_to_rust_fn<T>(
 ) -> impl Fn(StoreContextMut<'_, T>, &[Val], &mut [Val]) -> Result<()> + Send + Sync + 'static {
     let foreign = crate::ForeignData { data, finalizer };
     move |_store, params, results| {
-        println!("call host func");
         let _ = &foreign; // move entire foreign into this closure
 
         // Convert `params/results` to `wasmtime_component_val_t`. Use the previous
