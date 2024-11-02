@@ -629,6 +629,25 @@ impl<T> LinkerInstance<'_, T> {
         self.as_mut().into_instance(name)
     }
 
+    /// Returns existing instance with the given name
+    pub fn get_instance(mut self, name: &str) -> Option<Self> {
+        let k = self.strings.intern(name);
+        match self.map.raw_get_mut(&k) {
+            Some(def) => {
+                self.map = match def {
+                    Definition::Instance(map) => map,
+                    _ => unreachable!(),
+                };
+                self.path.truncate(self.path_len);
+                self.path.push(k);
+                self.path_len += 1;
+                return Some(self)
+            }
+
+            None => None
+        }
+    }
+
     /// Same as [`LinkerInstance::instance`] except with different lifetime
     /// parameters.
     pub fn into_instance(mut self, name: &str) -> Result<Self> {

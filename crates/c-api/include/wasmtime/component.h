@@ -105,13 +105,13 @@ WASMTIME_COMPONENT_DECLARE_VEC(val, wasmtime_component_val_t);
 WASMTIME_COMPONENT_DECLARE_VEC(val_record_field, wasmtime_component_val_record_field_t);
 
 // A variable sized bitset.
-WASMTIME_COMPONENT_DECLARE_VEC(val_flags, uint32_t);
+WASMTIME_COMPONENT_DECLARE_VEC(val_flags, wasm_name_t);
 
 #undef WASMTIME_COMPONENT_DECLARE_VEC
 
 // A variant contains the discriminant index and an optional value that is held.
 typedef struct wasmtime_component_val_variant_t {
-  uint32_t index;
+  wasm_name_t name;
   wasmtime_component_val_t *val;
 } wasmtime_component_val_variant_t;
 
@@ -124,7 +124,7 @@ typedef struct wasmtime_component_val_result_t {
 
 // Which value within an enumeration is selected.
 typedef struct wasmtime_component_val_enum_t {
-  uint32_t discriminant;
+  wasm_name_t name;
 } wasmtime_component_val_enum_t;
 
 typedef union wasmtime_component_val_payload_t {
@@ -191,8 +191,20 @@ WASM_API_EXTERN wasmtime_component_linker_t *
 wasmtime_component_linker_new(const wasm_engine_t *engine);
 
 WASM_API_EXTERN wasmtime_error_t *
-wasmtime_component_linker_link_wasi(wasmtime_component_linker_t *store,
+wasmtime_component_linker_link_wasi(wasmtime_component_linker_t *linker,
                                     wasm_trap_t **trap_out);
+
+typedef wasm_trap_t *(*wasmtime_component_func_callback_t)(
+    void *env, const wasmtime_component_val_t *args,
+    size_t nargs, wasmtime_component_val_t *results, size_t nresults);
+
+WASM_API_EXTERN wasmtime_error_t *
+wasmtime_component_linker_func_new(wasmtime_component_linker_t *linker,
+                                    const char* name,
+                                    size_t len,
+                                    wasmtime_component_func_callback_t callback,
+                                    void* data,
+                                    void (*finalizer)(void *));
 
 typedef struct wasmtime_component_instance_t wasmtime_component_instance_t;
 

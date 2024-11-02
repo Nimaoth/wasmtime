@@ -1,9 +1,9 @@
 use crate::ForeignData;
 use std::println;
 use std::ffi::c_void;
-use anyhow::{bail, ensure, Context, Result};
-use wasmtime::component::{Component, Func, Instance, Linker, Type, Val};
-use wasmtime::{AsContext, AsContextMut, StoreContextMut, Store, StoreLimits,
+use anyhow::{bail, Result, anyhow};
+use wasmtime::component::{Component, Func, Instance, Linker, Val};
+use wasmtime::{AsContextMut, StoreContextMut, Store, StoreLimits,
     StoreLimitsBuilder};
 use wasmtime_wasi::{WasiView, WasiCtx};
 
@@ -12,8 +12,16 @@ use crate::{
     declare_vecs, handle_call_error, handle_result, wasm_byte_vec_t, wasm_config_t, wasm_engine_t,
     wasm_name_t, wasm_trap_t, wasmtime_error_t, WasmtimeStoreData,
 };
-use std::collections::HashMap;
 use std::{mem, mem::MaybeUninit, ptr, slice};
+
+impl TryInto<String> for &wasm_name_t {
+    type Error = anyhow::Error;
+
+    fn try_into(self) -> Result<String, Self::Error> {
+        let name = std::str::from_utf8(self.as_slice())?;
+        Ok(name.to_owned())
+    }
+}
 
 #[no_mangle]
 pub extern "C" fn wasmtime_config_component_model_set(c: &mut wasm_config_t, enable: bool) {
@@ -151,7 +159,7 @@ declare_vecs! {
     )
     (
         name: wasmtime_component_val_flags_vec_t,
-        ty: u32,
+        ty: wasm_name_t,
         new: wasmtime_component_val_flags_vec_new,
         empty: wasmtime_component_val_flags_vec_new_empty,
         uninit: wasmtime_component_val_flags_vec_new_uninitialized,
@@ -163,7 +171,7 @@ declare_vecs! {
 #[repr(C)]
 #[derive(Clone)]
 pub struct wasmtime_component_val_variant_t {
-    pub index: u32,
+    pub name: wasm_name_t,
     pub val: Option<Box<wasmtime_component_val_t>>,
 }
 
@@ -177,37 +185,38 @@ pub struct wasmtime_component_val_result_t {
 #[repr(C)]
 #[derive(Clone)]
 pub struct wasmtime_component_val_enum_t {
-    pub discriminant: u32,
+    pub name: wasm_name_t,
 }
 
-#[no_mangle]
-pub extern "C" fn wasmtime_component_val_flags_set(
-    flags: &mut wasmtime_component_val_flags_vec_t,
-    index: u32,
-    enabled: bool,
-) {
-    let mut f = flags.take();
-    let (idx, bit) = ((index / u32::BITS) as usize, index % u32::BITS);
-    if idx >= f.len() {
-        f.resize(idx + 1, Default::default());
-    }
-    if enabled {
-        f[idx] |= 1 << (bit);
-    } else {
-        f[idx] &= !(1 << (bit));
-    }
-    flags.set_buffer(f);
-}
+// todo
+// #[no_mangle]
+// pub extern "C" fn wasmtime_component_val_flags_set(
+//     flags: &mut wasmtime_component_val_flags_vec_t,
+//     name: wasm_name_t,
+//     enabled: bool,
+// ) {
+//     let mut f = flags.take();
+//     let (idx, bit) = ((index / u32::BITS) as usize, index % u32::BITS);
+//     if idx >= f.len() {
+//         f.resize(idx + 1, Default::default());
+//     }
+//     if enabled {
+//         f[idx] |= 1 << (bit);
+//     } else {
+//         f[idx] &= !(1 << (bit));
+//     }
+//     flags.set_buffer(f);
+// }
 
-#[no_mangle]
-pub extern "C" fn wasmtime_component_val_flags_test(
-    flags: &wasmtime_component_val_flags_vec_t,
-    index: u32,
-) -> bool {
-    let flags = flags.as_slice();
-    let (idx, bit) = ((index / u32::BITS) as usize, index % u32::BITS);
-    flags.get(idx).map(|v| v & (1 << bit) != 0).unwrap_or(false)
-}
+// #[no_mangle]
+// pub extern "C" fn wasmtime_component_val_flags_test(
+//     flags: &wasmtime_component_val_flags_vec_t,
+//     index: u32,
+// ) -> bool {
+//     let flags = flags.as_slice();
+//     let (idx, bit) = ((index / u32::BITS) as usize, index % u32::BITS);
+//     flags.get(idx).map(|v| v & (1 << bit) != 0).unwrap_or(false)
+// }
 
 #[repr(C, u8)]
 #[derive(Clone)]
@@ -236,244 +245,76 @@ pub enum wasmtime_component_val_t {
 }
 
 impl wasmtime_component_val_t {
-    fn into_val(self, ty: &Type) -> Result<Val> {
+    fn into_val(self) -> Result<Val> {
         Ok(match self {
-            wasmtime_component_val_t::Bool(b) => {
-                ensure!(
-                    ty == &Type::Bool,
-                    "attempted to create a bool for a {}",
-                    ty.desc()
-                );
-                Val::Bool(b)
-            }
-            wasmtime_component_val_t::S8(v) => {
-                ensure!(
-                    ty == &Type::S8,
-                    "attempted to create a s8 for a {}",
-                    ty.desc()
-                );
-                Val::S8(v)
-            }
-            wasmtime_component_val_t::U8(v) => {
-                ensure!(
-                    ty == &Type::U8,
-                    "attempted to create a u8 for a {}",
-                    ty.desc()
-                );
-                Val::U8(v)
-            }
-            wasmtime_component_val_t::S16(v) => {
-                ensure!(
-                    ty == &Type::S16,
-                    "attempted to create a s16 for a {}",
-                    ty.desc()
-                );
-                Val::S16(v)
-            }
-            wasmtime_component_val_t::U16(v) => {
-                ensure!(
-                    ty == &Type::U16,
-                    "attempted to create a u16 for a {}",
-                    ty.desc()
-                );
-                Val::U16(v)
-            }
-            wasmtime_component_val_t::S32(v) => {
-                ensure!(
-                    ty == &Type::S32,
-                    "attempted to create a s32 for a {}",
-                    ty.desc()
-                );
-                Val::S32(v)
-            }
-            wasmtime_component_val_t::U32(v) => {
-                ensure!(
-                    ty == &Type::U32,
-                    "attempted to create a u32 for a {}",
-                    ty.desc()
-                );
-                Val::U32(v)
-            }
-            wasmtime_component_val_t::S64(v) => {
-                ensure!(
-                    ty == &Type::S64,
-                    "attempted to create a s64 for a {}",
-                    ty.desc()
-                );
-                Val::S64(v)
-            }
-            wasmtime_component_val_t::U64(v) => {
-                ensure!(
-                    ty == &Type::U64,
-                    "attempted to create a u64 for a {}",
-                    ty.desc()
-                );
-                Val::U64(v)
-            }
-            wasmtime_component_val_t::F32(v) => {
-                ensure!(
-                    ty == &Type::Float32,
-                    "attempted to create a float32 for a {}",
-                    ty.desc()
-                );
-                Val::Float32(v)
-            }
-            wasmtime_component_val_t::F64(v) => {
-                ensure!(
-                    ty == &Type::Float64,
-                    "attempted to create a float64 for a {}",
-                    ty.desc()
-                );
-                Val::Float64(v)
-            }
-            wasmtime_component_val_t::Char(v) => {
-                ensure!(
-                    ty == &Type::Char,
-                    "attempted to create a char for a {}",
-                    ty.desc()
-                );
-                Val::Char(v)
-            }
-            wasmtime_component_val_t::String(mut v) => {
-                ensure!(
-                    ty == &Type::String,
-                    "attempted to create a string for a {}",
-                    ty.desc()
-                );
-                Val::String(String::from_utf8(v.take())?)
-            }
+            wasmtime_component_val_t::Bool(b) => Val::Bool(b),
+            wasmtime_component_val_t::S8(v) => Val::S8(v),
+            wasmtime_component_val_t::U8(v) => Val::U8(v),
+            wasmtime_component_val_t::S16(v) => Val::S16(v),
+            wasmtime_component_val_t::U16(v) => Val::U16(v),
+            wasmtime_component_val_t::S32(v) => Val::S32(v),
+            wasmtime_component_val_t::U32(v) => Val::U32(v),
+            wasmtime_component_val_t::S64(v) => Val::S64(v),
+            wasmtime_component_val_t::U64(v) => Val::U64(v),
+            wasmtime_component_val_t::F32(v) => Val::Float32(v),
+            wasmtime_component_val_t::F64(v) => Val::Float64(v),
+            wasmtime_component_val_t::Char(v) => Val::Char(v),
+            wasmtime_component_val_t::String(mut v) => Val::String(String::from_utf8(v.take())?),
             wasmtime_component_val_t::List(mut v) => {
-                if let Type::List(ty) = ty {
-                    // Val::lift();
-                    // Val::List(Vec::from_raw_parts(ptr, length, capacity))
-                    let v: Vec<_> =
-                        v.take()
-                            .into_iter()
-                            .map(|v| v.into_val(&ty.ty()))
-                            .collect::<Result<Vec<_>>>()?;
-                    Val::List(v)
-                } else {
-                    bail!("attempted to create a list for a {}", ty.desc());
-                }
+                let v: Vec<_> =
+                    v.take()
+                        .into_iter()
+                        .map(|v| v.into_val())
+                        .collect::<Result<Vec<_>>>()?;
+                Val::List(v)
             }
             wasmtime_component_val_t::Record(mut v) => {
-                if let Type::Record(ty) = ty {
-                    let mut field_vals: HashMap<Vec<u8>, wasmtime_component_val_t> =
-                        HashMap::from_iter(
-                            v.take().into_iter().map(|mut f| (f.name.take(), f.val)),
-                        );
-                    let field_tys = ty.fields();
-                    let v = field_tys
-                            .map(|tyf| {
-                                if let Some(v) = field_vals.remove(tyf.name.as_bytes()) {
-                                    Ok((tyf.name.to_owned(), v.into_val(&tyf.ty)?))
-                                } else {
-                                    bail!("record missing field: {}", tyf.name);
-                                }
-                            })
-                            .collect::<Result<Vec<_>>>()?;
-                    Val::Record(v)
-                } else {
-                    bail!("attempted to create a record for a {}", ty.desc());
-                }
+                let v: Vec<_> = v.take().into_iter().map(|it| {
+                    let name = (&it.name).try_into()?;
+                    Ok((name, it.val.into_val()?))
+                }).collect::<Result<Vec<_>>>()?;
+                Val::Record(v)
             }
             wasmtime_component_val_t::Tuple(mut v) => {
-                if let Type::Tuple(ty) = ty {
-                    let v = ty.types()
-                        .zip(v.take().into_iter())
-                        .map(|(ty, v)| v.into_val(&ty))
-                        .collect::<Result<Vec<_>>>()?;
-                    Val::List(v)
-                } else {
-                    bail!("attempted to create a tuple for a {}", ty.desc());
-                }
+                let v = v.take().into_iter()
+                    .map(|v| v.into_val())
+                    .collect::<Result<Vec<_>>>()?;
+                Val::List(v)
             }
             wasmtime_component_val_t::Variant(v) => {
-                if let Type::Variant(ty) = ty {
-                    let case = ty
-                        .cases()
-                        .nth(v.index as usize)
-                        .with_context(|| format!("missing variant {}", v.index))?;
-                    ensure!(
-                        case.ty.is_some() == v.val.is_some(),
-                        "variant type mismatch: {}",
-                        case.ty.map(|ty| ty.desc()).unwrap_or("none")
-                    );
-                    if let (Some(t), Some(v)) = (case.ty, v.val) {
-                        let v = v.into_val(&t)?;
-                        Val::Variant(case.name.to_owned(), Some(Box::new(v)))
-                    } else {
-                        Val::Variant(case.name.to_owned(), None)
-                    }
+                if let Some(val) = v.val {
+                    Val::Variant((&v.name).try_into()?, Some(Box::new(val.into_val()?)))
                 } else {
-                    bail!("attempted to create a variant for a {}", ty.desc());
+                    Val::Variant((&v.name).try_into()?, None)
                 }
             }
             wasmtime_component_val_t::Enum(v) => {
-                if let Type::Enum(ty) = ty {
-                    let name = ty
-                        .names()
-                        .nth(v.discriminant as usize)
-                        .with_context(|| format!("missing enumeration {}", v.discriminant))?;
-                    Val::Enum(name.to_owned())
-                } else {
-                    bail!("attempted to create an enum for a {}", ty.desc());
-                }
+                Val::Enum((&v.name).try_into()?)
             }
             wasmtime_component_val_t::Option(v) => {
-                if let Type::Option(ty) = ty {
-                    Val::Option({
-                        match v {
-                            Some(v) => Some(Box::new(v.into_val(&ty.ty())?)),
-                            None => None,
-                        }
-                    })
-                } else {
-                    bail!("attempted to create an option for a {}", ty.desc());
-                }
+                Val::Option({
+                    match v {
+                        Some(v) => Some(Box::new(v.into_val()?)),
+                        None => None,
+                    }
+                })
             }
             wasmtime_component_val_t::Result(v) => {
-                if let Type::Result(ty) = ty {
-                    let v: Result<Option<Box<Val>>, Option<Box<Val>>> = if v.error {
-                        Ok(match v.value {
-                            Some(v) => {
-                                let ty = ty.err().context("expected err type")?;
-                                Some(Box::new(v.into_val(&ty)?))
-                            }
-                            None => {
-                                ensure!(ty.err().is_none(), "expected no err type");
-                                None
-                            }
-                        })
-                    } else {
-                        Ok(match v.value {
-                            Some(v) => {
-                                let ty = ty.ok().context("expected ok type")?;
-                                Some(Box::new(v.into_val(&ty)?))
-                            }
-                            None => {
-                                ensure!(ty.ok().is_none(), "expected no ok type");
-                                None
-                            }
-                        })
-                    };
-                    Val::Result(v)
+                let v: Result<Option<Box<Val>>, Option<Box<Val>>> = if v.error {
+                    Ok(match v.value {
+                        Some(v) => Some(Box::new(v.into_val()?)),
+                        None => None,
+                    })
                 } else {
-                    bail!("attempted to create a result for a {}", ty.desc());
-                }
+                    Ok(match v.value {
+                        Some(v) => Some(Box::new(v.into_val()?)),
+                        None => None,
+                    })
+                };
+                Val::Result(v)
             }
             wasmtime_component_val_t::Flags(flags) => {
-                if let Type::Flags(ty) = ty {
-                    let mut set = Vec::new();
-                    for (idx, name) in ty.names().enumerate() {
-                        if wasmtime_component_val_flags_test(&flags, idx as u32) {
-                            set.push(name.to_owned());
-                        }
-                    }
-                    Val::Flags(set)
-                } else {
-                    bail!("attempted to create a flags for a {}", ty.desc());
-                }
+                Val::Flags(flags.as_slice().iter().map(|it| Ok(it.try_into()?)).collect::<Result<Vec<String>>>()?)
             }
         })
     }
@@ -482,7 +323,7 @@ impl wasmtime_component_val_t {
 impl wasmtime_component_val_t {
     // type Error = anyhow::Error;
 
-    fn try_from(value: &Val, typ: Type) -> Result<Self, anyhow::Error> {
+    fn try_from(value: &Val) -> Result<Self, anyhow::Error> {
         Ok(match value {
             Val::Bool(v) => wasmtime_component_val_t::Bool(*v),
             Val::S8(v) => wasmtime_component_val_t::S8(*v),
@@ -501,17 +342,15 @@ impl wasmtime_component_val_t {
                 wasmtime_component_val_t::String(v.into())
             }
             Val::List(v) => {
-                let v = v.iter().map(|v| Self::try_from(v, typ.unwrap_list().ty())).collect::<Result<Vec<_>>>()?;
+                let v = v.iter().map(|v| Self::try_from(v)).collect::<Result<Vec<_>>>()?;
                 wasmtime_component_val_t::List(v.into())
             }
             Val::Record(v) => {
-                let recordTy = typ.unwrap_record();
-                let fields: HashMap<_, _> = HashMap::from_iter(recordTy.fields().map(|f| (f.name, f.ty)));
                 let v = v.into_iter()
                     .map(|(name, v)| {
                         Ok(wasmtime_component_val_record_field_t {
                             name: name.to_string().into_bytes().into(),
-                            val: Self::try_from(v, fields.get(name.as_str()).unwrap().clone())?,
+                            val: Self::try_from(v)?,
                         })
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -520,60 +359,43 @@ impl wasmtime_component_val_t {
             Val::Tuple(v) => {
                 let v = v
                     .into_iter()
-                    .zip(typ.unwrap_tuple().types())
-                    .map(|(v, ty)| Self::try_from(v, ty))
+                    .map(|v| Self::try_from(v))
                     .collect::<Result<Vec<_>>>()?;
                 wasmtime_component_val_t::Tuple(v.into())
             }
             Val::Variant(discriminant, v) => {
-                let index = typ.unwrap_variant()
-                    .cases()
-                    .enumerate()
-                    .find(|(_, v)| v.name == discriminant)
-                    .map(|(idx, _)| idx as u32)
-                    .context("expected valid discriminant")?;
                 let val = match v {
                     Some(v) => Some(Box::new(
-                        Self::try_from(
-                            v,
-                            typ.unwrap_variant().cases().nth(index as usize).unwrap().ty.unwrap())?)),
+                        Self::try_from(v)?)),
                     None => None,
                 };
-                wasmtime_component_val_t::Variant(wasmtime_component_val_variant_t { index, val })
+                wasmtime_component_val_t::Variant(wasmtime_component_val_variant_t {
+                    name: wasm_name_t::from_name(discriminant.clone()),
+                    val: val
+                })
             }
             Val::Enum(v) => {
-                let index = typ.unwrap_enum()
-                    .names()
-                    .zip(0u32..)
-                    .find(|(n, _)| *n == v)
-                    .map(|(_, idx)| idx)
-                    .context("expected valid discriminant")?;
                 wasmtime_component_val_t::Enum(wasmtime_component_val_enum_t {
-                    discriminant: index,
+                    name: wasm_name_t::from_name(v.clone()),
                 })
             }
             Val::Option(v) => wasmtime_component_val_t::Option(match v {
-                Some(v) => Some(Box::new(Self::try_from(v, typ.unwrap_option().ty())?)),
+                Some(v) => Some(Box::new(Self::try_from(v)?)),
                 None => None,
             }),
             Val::Result(v) => {
-                let (error, value, ty) = match v {
-                    Ok(v) => (false, v, typ.unwrap_result().ok()),
-                    Err(v) => (true, v, typ.unwrap_result().err()),
+                let (error, value) = match v {
+                    Ok(v) => (false, v),
+                    Err(v) => (true, v),
                 };
                 let value = match value {
-                    Some(v) => Some(Box::new(Self::try_from(v, ty.unwrap())?)),
+                    Some(v) => Some(Box::new(Self::try_from(v)?)),
                     None => None,
                 };
                 wasmtime_component_val_t::Result(wasmtime_component_val_result_t { value, error })
             }
             Val::Flags(v) => {
-                let mapping: HashMap<_, _> = typ.unwrap_flags().names().zip(0u32..).collect();
-                let mut flags: wasmtime_component_val_flags_vec_t = Vec::new().into();
-                for name in v {
-                    let idx = mapping.get(name.as_str()).context("expected valid name")?;
-                    wasmtime_component_val_flags_set(&mut flags, *idx, true);
-                }
+                let flags = v.iter().map(|name| wasm_name_t::from_name(name.clone())).collect::<Vec<_>>().into();
                 wasmtime_component_val_t::Flags(flags)
             }
             Val::Resource(_) => bail!("resource types are unimplemented"),
@@ -656,6 +478,101 @@ pub extern "C" fn wasmtime_component_linker_link_wasi(
     }
 }
 
+pub type wasmtime_component_func_callback_t = extern "C" fn(
+    *mut c_void,
+    *const wasmtime_component_val_t,
+    usize,
+    *mut wasmtime_component_val_t,
+    usize,
+) -> Option<Box<wasm_trap_t>>;
+
+unsafe fn c_callback_to_rust_fn<T>(
+    callback: wasmtime_component_func_callback_t,
+    data: *mut c_void,
+    finalizer: Option<extern "C" fn(*mut std::ffi::c_void)>,
+) -> impl Fn(StoreContextMut<'_, T>, &[Val], &mut [Val]) -> Result<()> + Send + Sync + 'static {
+    let foreign = crate::ForeignData { data, finalizer };
+    move |_store, params, results| {
+        println!("call host func");
+        let _ = &foreign; // move entire foreign into this closure
+
+        // Convert `params/results` to `wasmtime_component_val_t`. Use the previous
+        // storage in `hostcall_val_storage` to help avoid allocations all the
+        // time.
+
+        // todo
+        // let mut vals = mem::take(&mut caller.data_mut().hostcall_val_storage);
+        // debug_assert!(vals.is_empty());
+        let mut vals = vec![];
+
+        vals.reserve(params.len() + results.len());
+        vals.extend(
+            params
+                .iter()
+                .map(|p| wasmtime_component_val_t::try_from(p).unwrap()),
+        );
+        vals.extend((0..results.len()).map(|_| wasmtime_component_val_t::default()));
+        let (params, out_results) = vals.split_at_mut(params.len());
+
+        // Invoke the C function pointer, getting the results.
+
+        let out = callback(
+            foreign.data,
+            params.as_ptr(),
+            params.len(),
+            out_results.as_mut_ptr(),
+            out_results.len(),
+        );
+        if let Some(trap) = out {
+            return Err(trap.error);
+        }
+
+        // Translate the `wasmtime_component_val_t` results into the `results` space
+        for (i, result) in out_results.iter().enumerate() {
+            // todo: no clone
+            results[i] = result.clone().into_val()?;
+        }
+
+        // todo
+        // // Move our `vals` storage back into the store now that we no longer
+        // // need it. This'll get picked up by the next hostcall and reuse our
+        // // same storage.
+        // vals.truncate(0);
+        // caller.caller.data_mut().hostcall_val_storage = vals;
+        Ok(())
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn wasmtime_component_linker_func_new(
+    linker: &mut wasmtime_component_linker_t,
+    name: *const u8,
+    len: usize,
+    callback: wasmtime_component_func_callback_t,
+    data: *mut c_void,
+    finalizer: Option<extern "C" fn(*mut std::ffi::c_void)>,
+) -> Option<Box<wasmtime_error_t>> {
+    let name = crate::slice_from_raw_parts(name, len);
+    let name = match std::str::from_utf8(name) {
+        Ok(name) => name,
+        Err(_) => return Some(Box::new(anyhow!("Invalid utf8").into())),
+    };
+
+    if let Some(mut instance) = linker.linker.root().get_instance("env") {
+        return match instance.func_new(name, c_callback_to_rust_fn(callback, data, finalizer)) {
+            Ok(_) => None,
+            Err(e) => Some(Box::new(e.into())),
+        };
+    }
+
+    let mut instance = linker.linker.instance("env").unwrap();
+
+    match instance.func_new(name, c_callback_to_rust_fn(callback, data, finalizer)) {
+        Ok(_) => None,
+        Err(e) => Some(Box::new(e.into())),
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn wasmtime_component_linker_instantiate(
     linker: &wasmtime_component_linker_t,
@@ -714,17 +631,13 @@ fn call_func(
     raw_params: &[wasmtime_component_val_t],
     raw_results: &mut [wasmtime_component_val_t],
 ) -> Result<()> {
-    let params = func
-        .func
-        .params(context.as_context())
-        .iter()
-        .zip(raw_params.iter())
-        .map(|(ty, v)| v.clone().into_val(ty))
+    let params = raw_params.iter()
+        .map(|v| v.clone().into_val())
         .collect::<Result<Vec<_>>>()?;
     let mut results = vec![Val::Bool(false); raw_results.len()];
     func.func.call(context.as_context_mut(), &params, &mut results)?;
-    for (i, (ty, r)) in func.func.results(context.as_context()).iter().zip(results.iter()).enumerate() {
-        raw_results[i] = wasmtime_component_val_t::try_from(r, (*ty).clone())?;
+    for (i, r) in results.iter().enumerate() {
+        raw_results[i] = wasmtime_component_val_t::try_from(r)?;
     }
     func.func.post_return(context)?;
     Ok(())
