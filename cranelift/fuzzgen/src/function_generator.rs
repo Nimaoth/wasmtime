@@ -512,6 +512,10 @@ fn valid_for_target(triple: &Triple, op: Opcode, args: &[Type], rets: &[Type]) -
             }
         }
 
+        // This requires precise runtime integration so it's not supported at
+        // all in fuzzgen just yet.
+        Opcode::StackSwitch => return false,
+
         _ => {}
     }
 
@@ -911,7 +915,6 @@ static OPCODE_SIGNATURES: Lazy<Vec<OpcodeSignature>> = Lazy::new(|| {
                 (Opcode::GetFramePointer),
                 (Opcode::GetStackPointer),
                 (Opcode::GetReturnAddress),
-                (Opcode::Null),
                 (Opcode::X86Blendv),
                 (Opcode::IcmpImm),
                 (Opcode::X86Pmulhrsw),
@@ -922,11 +925,11 @@ static OPCODE_SIGNATURES: Lazy<Vec<OpcodeSignature>> = Lazy::new(|| {
                 (Opcode::UremImm),
                 (Opcode::SremImm),
                 (Opcode::IrsubImm),
-                (Opcode::IaddCin),
-                (Opcode::IaddCarry),
+                (Opcode::UaddOverflowCin),
+                (Opcode::SaddOverflowCin),
                 (Opcode::UaddOverflowTrap),
-                (Opcode::IsubBin),
-                (Opcode::IsubBorrow),
+                (Opcode::UsubOverflowBin),
+                (Opcode::SsubOverflowBin),
                 (Opcode::BandImm),
                 (Opcode::BorImm),
                 (Opcode::BxorImm),
@@ -935,8 +938,6 @@ static OPCODE_SIGNATURES: Lazy<Vec<OpcodeSignature>> = Lazy::new(|| {
                 (Opcode::IshlImm),
                 (Opcode::UshrImm),
                 (Opcode::SshrImm),
-                (Opcode::IsNull),
-                (Opcode::IsInvalid),
                 (Opcode::ScalarToVector),
                 (Opcode::X86Pmaddubsw),
                 (Opcode::X86Cvtt2dq),
@@ -1100,10 +1101,7 @@ fn inserter_for_format(fmt: InstructionFormat) -> OpcodeInserter {
         | InstructionFormat::Brif
         | InstructionFormat::Jump
         | InstructionFormat::MultiAry => {
-            panic!(
-                "Control-flow instructions should be handled by 'insert_terminator': {:?}",
-                fmt
-            )
+            panic!("Control-flow instructions should be handled by 'insert_terminator': {fmt:?}")
         }
     }
 }

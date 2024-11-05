@@ -161,7 +161,7 @@ impl Component {
     #[cfg(any(feature = "cranelift", feature = "winch"))]
     pub fn new(engine: &Engine, bytes: impl AsRef<[u8]>) -> Result<Component> {
         crate::CodeBuilder::new(engine)
-            .wasm(bytes.as_ref(), None)?
+            .wasm_binary_or_text(bytes.as_ref(), None)?
             .compile_component()
     }
 
@@ -173,7 +173,7 @@ impl Component {
     #[cfg(all(feature = "std", any(feature = "cranelift", feature = "winch")))]
     pub fn from_file(engine: &Engine, file: impl AsRef<Path>) -> Result<Component> {
         crate::CodeBuilder::new(engine)
-            .wasm_file(file.as_ref())?
+            .wasm_binary_or_text_file(file.as_ref())?
             .compile_component()
     }
 
@@ -189,8 +189,7 @@ impl Component {
     #[cfg(any(feature = "cranelift", feature = "winch"))]
     pub fn from_binary(engine: &Engine, binary: &[u8]) -> Result<Component> {
         crate::CodeBuilder::new(engine)
-            .wasm(binary, None)?
-            .wat(false)?
+            .wasm_binary(binary, None)?
             .compile_component()
     }
 
@@ -617,6 +616,30 @@ impl Component {
     /// [`Module::image_range`](crate::Module::image_range).
     pub fn image_range(&self) -> Range<*const u8> {
         self.inner.code.code_memory().mmap().image_range()
+    }
+
+    /// Force initialization of copy-on-write images to happen here-and-now
+    /// instead of when they're requested during first instantiation.
+    ///
+    /// When [copy-on-write memory
+    /// initialization](crate::Config::memory_init_cow) is enabled then Wasmtime
+    /// will lazily create the initialization image for a component. This method
+    /// can be used to explicitly dictate when this initialization happens.
+    ///
+    /// Note that this largely only matters on Linux when memfd is used.
+    /// Otherwise the copy-on-write image typically comes from disk and in that
+    /// situation the creation of the image is trivial as the image is always
+    /// sourced from disk. On Linux, though, when memfd is used a memfd is
+    /// created and the initialization image is written to it.
+    ///
+    /// Also note that this method is not required to be called, it's available
+    /// as a performance optimization if required but is otherwise handled
+    /// automatically.
+    pub fn initialize_copy_on_write_image(&self) -> Result<()> {
+        for (_, module) in self.inner.static_modules.iter() {
+            module.initialize_copy_on_write_image()?;
+        }
+        Ok(())
     }
 
     /// Looks up a specific export of this component by `name` optionally nested

@@ -28,10 +28,9 @@
 
 use crate::{
     DefinedGlobalIndex, DefinedMemoryIndex, DefinedTableIndex, FuncIndex, FuncRefIndex,
-    GlobalIndex, MemoryIndex, Module, TableIndex,
+    GlobalIndex, MemoryIndex, Module, OwnedMemoryIndex, TableIndex,
 };
 use cranelift_entity::packed_option::ReservedValue;
-use wasmtime_types::OwnedMemoryIndex;
 
 #[cfg(target_pointer_width = "32")]
 fn cast_to_u32(sz: usize) -> u32 {
@@ -584,7 +583,7 @@ impl<P: PtrSize> VMOffsets<P> {
     /// The size of the `current_elements` field.
     #[inline]
     pub fn size_of_vmtable_definition_current_elements(&self) -> u8 {
-        4
+        self.pointer_size()
     }
 
     /// Return the size of `VMTableDefinition`.

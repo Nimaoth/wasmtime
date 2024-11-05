@@ -2,61 +2,9 @@ use super::regs;
 use crate::{
     abi::{align_to, ABIOperand, ABIParams, ABIResults, ABISig, ParamsOrReturns, ABI},
     isa::{reg::Reg, CallingConvention},
+    RegIndexEnv,
 };
 use wasmtime_environ::{WasmHeapType, WasmRefType, WasmValType};
-
-/// Helper environment to track argument-register
-/// assignment in x64.
-///
-/// The first element tracks the general purpose register index.
-/// The second element tracks the floating point register index.
-#[derive(Default)]
-struct RegIndexEnv {
-    /// General purpose register index or the field used for absolute
-    /// counts.
-    gpr_or_absolute_count: u8,
-    /// Floating point register index.
-    fpr: u8,
-    /// Whether the count should be absolute rather than per register class.
-    /// When this field is true, only the `gpr_or_absolute_count` field is
-    /// incremented.
-    absolute_count: bool,
-}
-
-impl RegIndexEnv {
-    fn with_absolute_count() -> Self {
-        Self {
-            gpr_or_absolute_count: 0,
-            fpr: 0,
-            absolute_count: true,
-        }
-    }
-}
-
-impl RegIndexEnv {
-    fn next_gpr(&mut self) -> Option<u8> {
-        Self::increment(&mut self.gpr_or_absolute_count)
-    }
-
-    fn next_fpr(&mut self) -> Option<u8> {
-        if self.absolute_count {
-            Self::increment(&mut self.gpr_or_absolute_count)
-        } else {
-            Self::increment(&mut self.fpr)
-        }
-    }
-
-    fn increment(index: &mut u8) -> Option<u8> {
-        let current = *index;
-        match index.checked_add(1) {
-            Some(next) => {
-                *index = next;
-                Some(current)
-            }
-            None => None,
-        }
-    }
-}
 
 #[derive(Default)]
 pub(crate) struct X64ABI;
@@ -99,9 +47,9 @@ impl ABI for X64ABI {
         // See
         // https://learn.microsoft.com/en-us/cpp/build/stack-usage?view=msvc-170#stack-allocation
         let (params_stack_offset, mut params_index_env) = if is_fastcall {
-            (32, RegIndexEnv::with_absolute_count())
+            (32, RegIndexEnv::with_absolute_limit(4))
         } else {
-            (0, RegIndexEnv::default())
+            (0, RegIndexEnv::with_limits_per_class(6, 8))
         };
 
         let results = Self::abi_results(returns, call_conv);
@@ -124,11 +72,13 @@ impl ABI for X64ABI {
     }
 
     fn abi_results(returns: &[WasmValType], call_conv: &CallingConvention) -> ABIResults {
+        assert!(call_conv.is_default() || call_conv.is_fastcall() || call_conv.is_systemv());
         // Use absolute count for results given that for Winch's
         // default CallingConvention only one register is used for results
-        // independent of the register class. This also aligns with how
-        // multiple results are handled by Wasmtime.
-        let mut results_index_env = RegIndexEnv::with_absolute_count();
+        // independent of the register class.
+        // In the case of 2+ results, the rest are passed in the stack,
+        // similar to how Wasmtime handles multi-value returns.
+        let mut results_index_env = RegIndexEnv::with_absolute_limit(1);
         ABIResults::from(returns, call_conv, |ty, offset| {
             Self::to_abi_operand(
                 ty,
@@ -170,7 +120,7 @@ impl ABI for X64ABI {
     fn sizeof(ty: &WasmValType) -> u8 {
         match ty {
             WasmValType::Ref(rt) => match rt.heap_type {
-                WasmHeapType::Func => Self::word_bytes(),
+                WasmHeapType::Func | WasmHeapType::Extern => Self::word_bytes(),
                 ht => unimplemented!("Support for WasmHeapType: {ht}"),
             },
             WasmValType::F64 | WasmValType::I64 => Self::word_bytes(),
@@ -190,7 +140,7 @@ impl X64ABI {
     ) -> (ABIOperand, u32) {
         let (reg, ty) = match wasm_arg {
             ty @ WasmValType::Ref(rt) => match rt.heap_type {
-                WasmHeapType::Func => (
+                WasmHeapType::Func | WasmHeapType::Extern => (
                     Self::int_reg_for(index_env.next_gpr(), call_conv, params_or_returns),
                     ty,
                 ),
@@ -325,7 +275,7 @@ impl X64ABI {
 
 #[cfg(test)]
 mod tests {
-    use super::{RegIndexEnv, X64ABI};
+    use super::X64ABI;
     use crate::{
         abi::{ABIOperand, ABI},
         isa::{reg::Reg, x64::regs, CallingConvention},
@@ -334,26 +284,6 @@ mod tests {
         WasmFuncType,
         WasmValType::{self, *},
     };
-
-    #[test]
-    fn test_get_next_reg_index() {
-        let mut index_env = RegIndexEnv::default();
-        assert_eq!(index_env.next_fpr(), Some(0));
-        assert_eq!(index_env.next_gpr(), Some(0));
-        assert_eq!(index_env.next_fpr(), Some(1));
-        assert_eq!(index_env.next_gpr(), Some(1));
-        assert_eq!(index_env.next_fpr(), Some(2));
-        assert_eq!(index_env.next_gpr(), Some(2));
-    }
-
-    #[test]
-    fn test_reg_index_env_absolute_count() {
-        let mut e = RegIndexEnv::with_absolute_count();
-        assert!(e.next_gpr() == Some(0));
-        assert!(e.next_fpr() == Some(1));
-        assert!(e.next_gpr() == Some(2));
-        assert!(e.next_fpr() == Some(3));
-    }
 
     #[test]
     fn int_abi_sig() {
@@ -384,14 +314,14 @@ mod tests {
         let params = sig.params;
         let results = sig.results;
 
-        match_reg_arg(params.get(0).unwrap(), I32, regs::rdi());
-        match_reg_arg(params.get(1).unwrap(), I64, regs::rsi());
-        match_reg_arg(params.get(2).unwrap(), I32, regs::rdx());
-        match_reg_arg(params.get(3).unwrap(), I64, regs::rcx());
-        match_reg_arg(params.get(4).unwrap(), I32, regs::r8());
-        match_reg_arg(params.get(5).unwrap(), I32, regs::r9());
-        match_stack_arg(params.get(6).unwrap(), I64, 0);
-        match_stack_arg(params.get(7).unwrap(), I32, 8);
+        match_reg_arg(params.get(0).unwrap(), I32, regs::rsi());
+        match_reg_arg(params.get(1).unwrap(), I64, regs::rdx());
+        match_reg_arg(params.get(2).unwrap(), I32, regs::rcx());
+        match_reg_arg(params.get(3).unwrap(), I64, regs::r8());
+        match_reg_arg(params.get(4).unwrap(), I32, regs::r9());
+        match_stack_arg(params.get(5).unwrap(), I32, 0);
+        match_stack_arg(params.get(6).unwrap(), I64, 8);
+        match_stack_arg(params.get(7).unwrap(), I32, 16);
 
         match_stack_arg(results.get(0).unwrap(), I32, 4);
         match_stack_arg(results.get(1).unwrap(), I32, 0);
@@ -524,13 +454,13 @@ mod tests {
         let params = sig.params;
         let results = sig.results;
 
-        match_reg_arg(params.get(0).unwrap(), F32, regs::xmm0());
-        match_reg_arg(params.get(1).unwrap(), I32, regs::rdx());
-        match_reg_arg(params.get(2).unwrap(), I64, regs::r8());
-        match_reg_arg(params.get(3).unwrap(), F64, regs::xmm3());
+        match_reg_arg(params.get(0).unwrap(), F32, regs::xmm1());
+        match_reg_arg(params.get(1).unwrap(), I32, regs::r8());
+        match_reg_arg(params.get(2).unwrap(), I64, regs::r9());
         // Each argument stack slot is 8 bytes.
-        match_stack_arg(params.get(4).unwrap(), I32, 32);
-        match_stack_arg(params.get(5).unwrap(), F32, 40);
+        match_stack_arg(params.get(3).unwrap(), F64, 32);
+        match_stack_arg(params.get(4).unwrap(), I32, 40);
+        match_stack_arg(params.get(5).unwrap(), F32, 48);
 
         match_reg_arg(results.get(0).unwrap(), I32, regs::rax());
 
@@ -540,25 +470,25 @@ mod tests {
         match_stack_arg(results.get(4).unwrap(), I64, 12);
     }
 
-    #[cfg(test)]
+    #[track_caller]
     fn match_reg_arg(abi_arg: &ABIOperand, expected_ty: WasmValType, expected_reg: Reg) {
         match abi_arg {
             &ABIOperand::Reg { reg, ty, .. } => {
                 assert_eq!(reg, expected_reg);
                 assert_eq!(ty, expected_ty);
             }
-            stack => panic!("Expected reg argument, got {:?}", stack),
+            stack => panic!("Expected reg argument, got {stack:?}"),
         }
     }
 
-    #[cfg(test)]
+    #[track_caller]
     fn match_stack_arg(abi_arg: &ABIOperand, expected_ty: WasmValType, expected_offset: u32) {
         match abi_arg {
             &ABIOperand::Stack { offset, ty, .. } => {
                 assert_eq!(offset, expected_offset);
                 assert_eq!(ty, expected_ty);
             }
-            reg => panic!("Expected stack argument, got {:?}", reg),
+            reg => panic!("Expected stack argument, got {reg:?}"),
         }
     }
 }

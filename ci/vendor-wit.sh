@@ -37,23 +37,22 @@ make_vendor() {
 cache_dir=$(mktemp -d)
 
 make_vendor "wasi" "
-  cli@v0.2.0
-  clocks@v0.2.0
-  filesystem@v0.2.0
-  io@v0.2.0
-  random@v0.2.0
-  sockets@v0.2.0
-  http@v0.2.0
+  cli@v0.2.1
+  clocks@v0.2.1
+  filesystem@v0.2.1
+  io@v0.2.1
+  random@v0.2.1
+  sockets@v0.2.1
 "
 
 make_vendor "wasi-http" "
-  cli@v0.2.0
-  clocks@v0.2.0
-  filesystem@v0.2.0
-  io@v0.2.0
-  random@v0.2.0
-  sockets@v0.2.0
-  http@v0.2.0
+  cli@v0.2.1
+  clocks@v0.2.1
+  filesystem@v0.2.1
+  io@v0.2.1
+  random@v0.2.1
+  sockets@v0.2.1
+  http@v0.2.1
 "
 
 make_vendor "wasi-runtime-config" "runtime-config@c667fe6"
@@ -65,6 +64,6 @@ rm -rf $cache_dir
 # Separately (for now), vendor the `wasi-nn` WIT files since their retrieval is
 # slightly different than above.
 repo=https://raw.githubusercontent.com/WebAssembly/wasi-nn
-revision=0.2.0-rc-2024-06-25
+revision=0.2.0-rc-2024-08-19
 curl -L $repo/$revision/wasi-nn.witx -o crates/wasi-nn/witx/wasi-nn.witx
 curl -L $repo/$revision/wit/wasi-nn.wit -o crates/wasi-nn/wit/wasi-nn.wit

@@ -196,7 +196,8 @@ impl Global {
                 Val::ExternRef(e) => {
                     let new = match e {
                         None => None,
-                        Some(e) => Some(e.try_gc_ref(&mut store)?.unchecked_copy()),
+                        #[cfg_attr(not(feature = "gc"), allow(unreachable_patterns))]
+                        Some(e) => Some(e.try_gc_ref(&store)?.unchecked_copy()),
                     };
                     let new = new.as_ref();
                     definition.write_gc_ref(store.unwrap_gc_store_mut(), new);
@@ -204,7 +205,8 @@ impl Global {
                 Val::AnyRef(a) => {
                     let new = match a {
                         None => None,
-                        Some(a) => Some(a.try_gc_ref(&mut store)?.unchecked_copy()),
+                        #[cfg_attr(not(feature = "gc"), allow(unreachable_patterns))]
+                        Some(a) => Some(a.try_gc_ref(&store)?.unchecked_copy()),
                     };
                     let new = new.as_ref();
                     definition.write_gc_ref(store.unwrap_gc_store_mut(), new);
@@ -224,7 +226,7 @@ impl Global {
                 let gc_ref = NonNull::from(gc_ref);
                 let gc_ref = SendSyncPtr::new(gc_ref);
                 unsafe {
-                    gc_roots_list.add_root(gc_ref);
+                    gc_roots_list.add_root(gc_ref, "Wasm global");
                 }
             }
         }

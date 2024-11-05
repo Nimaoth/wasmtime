@@ -1,14 +1,13 @@
 use crate::component::{MAX_FLAT_PARAMS, MAX_FLAT_RESULTS};
 use crate::prelude::*;
-use crate::{EntityType, ModuleTypes, PrimaryMap};
+use crate::{EntityType, ModuleInternedTypeIndex, ModuleTypes, PrimaryMap};
 use core::hash::{Hash, Hasher};
 use core::ops::Index;
 use serde_derive::{Deserialize, Serialize};
 use wasmparser::types;
 use wasmtime_component_util::{DiscriminantSize, FlagsSize};
-use wasmtime_types::ModuleInternedTypeIndex;
 
-pub use wasmtime_types::StaticModuleIndex;
+pub use crate::StaticModuleIndex;
 
 macro_rules! indices {
     ($(
@@ -732,6 +731,24 @@ impl CanonicalAbiInfo {
             ),
             align64: max_align64,
             flat_count: add_flat(max_case_count, Some(1)),
+        }
+    }
+
+    /// Calculates ABI information for an enum with `cases` cases.
+    pub const fn enum_(cases: usize) -> CanonicalAbiInfo {
+        // NB: this is basically a duplicate definition of
+        // `CanonicalAbiInfo::variant`, these should be kept in sync.
+
+        let discrim_size = match DiscriminantSize::from_count(cases) {
+            Some(size) => size.byte_size(),
+            None => unreachable!(),
+        };
+        CanonicalAbiInfo {
+            size32: discrim_size,
+            align32: discrim_size,
+            size64: discrim_size,
+            align64: discrim_size,
+            flat_count: Some(1),
         }
     }
 

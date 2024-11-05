@@ -22,6 +22,14 @@ pub fn val<T>(store: &mut Store<T>, v: &WastArgCore<'_>) -> Result<Val> {
             ty: AbstractHeapType::Func,
             shared: false,
         }) => Val::FuncRef(None),
+        RefNull(HeapType::Abstract {
+            ty: AbstractHeapType::Any,
+            shared: false,
+        }) => Val::AnyRef(None),
+        RefNull(HeapType::Abstract {
+            shared: false,
+            ty: AbstractHeapType::None,
+        }) => Val::AnyRef(None),
         RefExtern(x) => Val::ExternRef(Some(ExternRef::new(store, *x)?)),
         other => bail!("couldn't convert {:?} to a runtime value", other),
     })
@@ -105,11 +113,33 @@ pub fn match_val<T>(store: &Store<T>, actual: &Val, expected: &WastRetCore) -> R
             }
         }
 
+        (Val::AnyRef(Some(_)), WastRetCore::RefAny) => Ok(()),
+        (Val::AnyRef(Some(x)), WastRetCore::RefEq) => {
+            if x.is_eqref(store)? {
+                Ok(())
+            } else {
+                bail!("expected an eqref, found {x:?}");
+            }
+        }
         (Val::AnyRef(Some(x)), WastRetCore::RefI31) => {
             if x.is_i31(store)? {
                 Ok(())
             } else {
                 bail!("expected a `(ref i31)`, found {x:?}");
+            }
+        }
+        (Val::AnyRef(Some(x)), WastRetCore::RefStruct) => {
+            if x.is_struct(store)? {
+                Ok(())
+            } else {
+                bail!("expected a struct reference, found {x:?}")
+            }
+        }
+        (Val::AnyRef(Some(x)), WastRetCore::RefArray) => {
+            if x.is_array(store)? {
+                Ok(())
+            } else {
+                bail!("expected a array reference, found {x:?}")
             }
         }
 
@@ -365,14 +395,14 @@ fn match_v128(actual: u128, expected: &V128Pattern) -> Result<()> {
         V128Pattern::F32x4(expected) => {
             for (i, expected) in expected.iter().enumerate() {
                 let a = extract_lane_as_i32(actual, i) as u32;
-                match_f32(a, expected).with_context(|| format!("difference in lane {}", i))?;
+                match_f32(a, expected).with_context(|| format!("difference in lane {i}"))?;
             }
             Ok(())
         }
         V128Pattern::F64x2(expected) => {
             for (i, expected) in expected.iter().enumerate() {
                 let a = extract_lane_as_i64(actual, i) as u64;
-                match_f64(a, expected).with_context(|| format!("difference in lane {}", i))?;
+                match_f64(a, expected).with_context(|| format!("difference in lane {i}"))?;
             }
             Ok(())
         }

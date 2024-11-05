@@ -1,14 +1,13 @@
 //! Compilation support for the component model.
 
-use crate::{compiler::Compiler, ALWAYS_TRAP_CODE, CANNOT_ENTER_CODE};
+use crate::{compiler::Compiler, TRAP_ALWAYS, TRAP_CANNOT_ENTER, TRAP_INTERNAL_ASSERT};
 use anyhow::Result;
 use cranelift_codegen::ir::{self, InstBuilder, MemFlags};
 use cranelift_codegen::isa::{CallConv, TargetIsa};
 use cranelift_frontend::FunctionBuilder;
-use cranelift_wasm::ModuleInternedTypeIndex;
 use std::any::Any;
 use wasmtime_environ::component::*;
-use wasmtime_environ::{PtrSize, WasmValType};
+use wasmtime_environ::{ModuleInternedTypeIndex, PtrSize, Tunables, WasmValType};
 
 struct TrampolineCompiler<'a> {
     compiler: &'a Compiler,
@@ -20,6 +19,7 @@ struct TrampolineCompiler<'a> {
     abi: Abi,
     block0: ir::Block,
     signature: ModuleInternedTypeIndex,
+    tunables: &'a Tunables,
 }
 
 #[derive(Copy, Clone)]
@@ -36,6 +36,7 @@ impl<'a> TrampolineCompiler<'a> {
         types: &'a ComponentTypesBuilder,
         index: TrampolineIndex,
         abi: Abi,
+        tunables: &'a Tunables,
     ) -> TrampolineCompiler<'a> {
         let isa = &*compiler.isa;
         let signature = component.trampolines[index];
@@ -58,6 +59,7 @@ impl<'a> TrampolineCompiler<'a> {
             abi,
             block0,
             signature,
+            tunables,
         }
     }
 
@@ -77,9 +79,7 @@ impl<'a> TrampolineCompiler<'a> {
                     // Transcoders can only actually be called by Wasm, so let's assert
                     // that here.
                     Abi::Array => {
-                        self.builder
-                            .ins()
-                            .trap(ir::TrapCode::User(crate::DEBUG_ASSERT_TRAP_CODE));
+                        self.builder.ins().trap(TRAP_INTERNAL_ASSERT);
                     }
                 }
             }
@@ -91,9 +91,7 @@ impl<'a> TrampolineCompiler<'a> {
                 self.translate_lower_import(*index, options, *lower_ty);
             }
             Trampoline::AlwaysTrap => {
-                self.builder
-                    .ins()
-                    .trap(ir::TrapCode::User(ALWAYS_TRAP_CODE));
+                self.translate_always_trap();
             }
             Trampoline::ResourceNew(ty) => self.translate_resource_new(*ty),
             Trampoline::ResourceRep(ty) => self.translate_resource_rep(*ty),
@@ -259,6 +257,30 @@ impl<'a> TrampolineCompiler<'a> {
                 self.builder.ins().return_(&[]);
             }
         }
+    }
+
+    fn translate_always_trap(&mut self) {
+        if self.tunables.signals_based_traps {
+            self.builder.ins().trap(TRAP_ALWAYS);
+            return;
+        }
+
+        let args = self.abi_load_params();
+        let vmctx = args[0];
+
+        let (host_sig, offset) = host::trap(self.isa, &mut self.builder.func);
+        let host_fn = self.load_libcall(vmctx, offset);
+
+        let code = self.builder.ins().iconst(
+            ir::types::I8,
+            i64::from(wasmtime_environ::Trap::AlwaysTrapAdapter as u8),
+        );
+        self.builder
+            .ins()
+            .call_indirect(host_sig, host_fn, &[vmctx, code]);
+        // debug trap in case execution actually falls through, but this
+        // shouldn't ever get hit at runtime.
+        self.builder.ins().trap(TRAP_INTERNAL_ASSERT);
     }
 
     fn translate_resource_new(&mut self, resource: TypeResourceTableIndex) {
@@ -446,9 +468,7 @@ impl<'a> TrampolineCompiler<'a> {
                     .builder
                     .ins()
                     .band_imm(flags, i64::from(FLAG_MAY_ENTER));
-                self.builder
-                    .ins()
-                    .trapz(masked, ir::TrapCode::User(CANNOT_ENTER_CODE));
+                self.builder.ins().trapz(masked, TRAP_CANNOT_ENTER);
             }
         }
 
@@ -468,10 +488,9 @@ impl<'a> TrampolineCompiler<'a> {
                 i32::try_from(self.offsets.resource_destructor(index)).unwrap(),
             );
             if cfg!(debug_assertions) {
-                self.builder.ins().trapz(
-                    dtor_func_ref,
-                    ir::TrapCode::User(crate::DEBUG_ASSERT_TRAP_CODE),
-                );
+                self.builder
+                    .ins()
+                    .trapz(dtor_func_ref, TRAP_INTERNAL_ASSERT);
             }
             let func_addr = self.builder.ins().load(
                 pointer_type,
@@ -526,9 +545,7 @@ impl<'a> TrampolineCompiler<'a> {
             // These trampolines can only actually be called by Wasm, so
             // let's assert that here.
             Abi::Array => {
-                self.builder
-                    .ins()
-                    .trap(ir::TrapCode::User(crate::DEBUG_ASSERT_TRAP_CODE));
+                self.builder.ins().trap(TRAP_INTERNAL_ASSERT);
                 return;
             }
         }
@@ -625,6 +642,7 @@ impl ComponentCompiler for Compiler {
         component: &ComponentTranslation,
         types: &ComponentTypesBuilder,
         index: TrampolineIndex,
+        tunables: &Tunables,
     ) -> Result<AllCallFunc<Box<dyn Any + Send>>> {
         let compile = |abi: Abi| -> Result<_> {
             let mut compiler = self.function_compiler();
@@ -635,6 +653,7 @@ impl ComponentCompiler for Compiler {
                 types,
                 index,
                 abi,
+                tunables,
             );
 
             // If we are crossing the Wasm-to-native boundary, we need to save the
@@ -907,6 +926,7 @@ mod host {
         (@ty $ptr:ident ptr_u8) => ($ptr);
         (@ty $ptr:ident ptr_u16) => ($ptr);
         (@ty $ptr:ident ptr_size) => ($ptr);
+        (@ty $ptr:ident u8) => (ir::types::I8);
         (@ty $ptr:ident u32) => (ir::types::I32);
         (@ty $ptr:ident u64) => (ir::types::I64);
         (@ty $ptr:ident vmctx) => ($ptr);

@@ -49,10 +49,10 @@ pub fn log_wasm(wasm: &[u8]) {
     }
 
     let i = CNT.fetch_add(1, SeqCst);
-    let name = format!("testcase{}.wasm", i);
+    let name = format!("testcase{i}.wasm");
     std::fs::write(&name, wasm).expect("failed to write wasm file");
     log::debug!("wrote wasm file to `{}`", name);
-    let wat = format!("testcase{}.wat", i);
+    let wat = format!("testcase{i}.wat");
     match wasmprinter::print_bytes(wasm) {
         Ok(s) => std::fs::write(&wat, s).expect("failed to write wat file"),
         // If wasmprinter failed remove a `*.wat` file, if any, to avoid
@@ -116,8 +116,13 @@ impl ResourceLimiter for StoreLimits {
         Ok(self.alloc(desired - current))
     }
 
-    fn table_growing(&mut self, current: u32, desired: u32, _maximum: Option<u32>) -> Result<bool> {
-        let delta = (desired - current) as usize * std::mem::size_of::<usize>();
+    fn table_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> Result<bool> {
+        let delta = (desired - current).saturating_mul(std::mem::size_of::<usize>());
         Ok(self.alloc(delta))
     }
 }
@@ -311,7 +316,7 @@ fn compile_module(
                 }
             }
 
-            panic!("failed to compile module: {:?}", e);
+            panic!("failed to compile module: {e:?}");
         }
     }
 }
@@ -375,7 +380,7 @@ fn unwrap_instance(
     }
 
     // Everything else should be a bug in the fuzzer or a bug in wasmtime
-    panic!("failed to instantiate: {:?}", e);
+    panic!("failed to instantiate: {e:?}");
 }
 
 /// Evaluate the function identified by `name` in two different engine
@@ -484,7 +489,13 @@ impl<T, U> DiffEqResult<T, U> {
             // of the two instances, so `None` is returned and nothing else is
             // compared.
             (Err(lhs), Err(rhs)) => {
-                let err = rhs.downcast::<Trap>().expect("not a trap");
+                let err = match rhs.downcast::<Trap>() {
+                    Ok(trap) => trap,
+                    Err(err) => {
+                        log::debug!("rhs failed: {err:?}");
+                        return DiffEqResult::Failed;
+                    }
+                };
                 let poisoned = err == Trap::StackOverflow || lhs_engine.is_stack_overflow(&lhs);
 
                 if poisoned {
@@ -494,8 +505,8 @@ impl<T, U> DiffEqResult<T, U> {
                 DiffEqResult::Failed
             }
             // A real bug is found if only one side fails.
-            (Ok(_), Err(_)) => panic!("only the `rhs` failed for this input"),
-            (Err(_), Ok(_)) => panic!("only the `lhs` failed for this input"),
+            (Ok(_), Err(err)) => panic!("only the `rhs` failed for this input: {err:?}"),
+            (Err(err), Ok(_)) => panic!("only the `lhs` failed for this input: {err:?}"),
         }
     }
 }
@@ -744,6 +755,11 @@ pub fn table_ops(
 
         {
             let mut scope = RootScope::new(&mut store);
+
+            log::info!(
+                "table_ops: begin allocating {} externref arguments",
+                ops.num_globals
+            );
             let args: Vec<_> = (0..ops.num_params)
                 .map(|_| {
                     Ok(Val::ExternRef(Some(ExternRef::new(
@@ -752,11 +768,16 @@ pub fn table_ops(
                     )?)))
                 })
                 .collect::<Result<_>>()?;
+            log::info!(
+                "table_ops: end allocating {} externref arguments",
+                ops.num_globals
+            );
 
             // The generated function should always return a trap. The only two
             // valid traps are table-out-of-bounds which happens through `table.get`
             // and `table.set` generated or an out-of-fuel trap. Otherwise any other
             // error is unexpected and should fail fuzzing.
+            log::info!("table_ops: calling into Wasm `run` function");
             let trap = run
                 .call(&mut scope, &args, &mut [])
                 .unwrap_err()
@@ -783,38 +804,6 @@ pub fn table_ops(
             self.0.fetch_add(1, SeqCst);
         }
     }
-}
-
-// Test that the `table_ops` fuzzer eventually runs the gc function in the host.
-// We've historically had issues where this fuzzer accidentally wasn't fuzzing
-// anything for a long time so this is an attempt to prevent that from happening
-// again.
-#[test]
-fn table_ops_eventually_gcs() {
-    use arbitrary::Unstructured;
-    use rand::prelude::*;
-
-    // Skip if we're under emulation because some fuzz configurations will do
-    // large address space reservations that QEMU doesn't handle well.
-    if std::env::var("WASMTIME_TEST_NO_HOG_MEMORY").is_ok() {
-        return;
-    }
-
-    let mut rng = SmallRng::seed_from_u64(0);
-    let mut buf = vec![0; 2048];
-    let n = 100;
-    for _ in 0..n {
-        rng.fill_bytes(&mut buf);
-        let u = Unstructured::new(&buf);
-
-        if let Ok((config, test)) = Arbitrary::arbitrary_take_rest(u) {
-            if table_ops(config, test).unwrap() > 0 {
-                return;
-            }
-        }
-    }
-
-    panic!("after {n} runs nothing ever gc'd, something is probably wrong");
 }
 
 #[derive(Default)]
@@ -1159,5 +1148,42 @@ pub fn call_async(wasm: &[u8], config: &generators::Config, mut poll_amts: &[u32
                 Poll::Pending => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Test that the `table_ops` fuzzer eventually runs the gc function in the host.
+    // We've historically had issues where this fuzzer accidentally wasn't fuzzing
+    // anything for a long time so this is an attempt to prevent that from happening
+    // again.
+    #[test]
+    fn table_ops_eventually_gcs() {
+        use arbitrary::Unstructured;
+        use rand::prelude::*;
+
+        // Skip if we're under emulation because some fuzz configurations will do
+        // large address space reservations that QEMU doesn't handle well.
+        if std::env::var("WASMTIME_TEST_NO_HOG_MEMORY").is_ok() {
+            return;
+        }
+
+        let mut rng = SmallRng::seed_from_u64(0);
+        let mut buf = vec![0; 2048];
+        let n = 100;
+        for _ in 0..n {
+            rng.fill_bytes(&mut buf);
+            let u = Unstructured::new(&buf);
+
+            if let Ok((config, test)) = Arbitrary::arbitrary_take_rest(u) {
+                if table_ops(config, test).unwrap() > 0 {
+                    return;
+                }
+            }
+        }
+
+        panic!("after {n} runs nothing ever gc'd, something is probably wrong");
     }
 }

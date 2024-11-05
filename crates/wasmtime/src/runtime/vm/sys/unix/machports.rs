@@ -31,11 +31,18 @@
 //! function declarations. Many bits and pieces are copied or translated from
 //! the SpiderMonkey implementation and it should pass all the tests!
 
-#![allow(non_snake_case, clippy::cast_sign_loss)]
+#![allow(
+    // FFI bindings here for C/etc don't follow Rust's naming conventions.
+    non_snake_case,
+    // Platform-specific code has a lot of false positives with these lints so
+    // like Unix disable the lints for this module.
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation
+)]
 
 use crate::runtime::module::lookup_code;
 use crate::runtime::vm::sys::traphandlers::wasmtime_longjmp;
-use crate::runtime::vm::traphandlers::tls;
+use crate::runtime::vm::traphandlers::{tls, TrapRegisters};
 use mach2::exc::*;
 use mach2::exception_types::*;
 use mach2::kern_return::*;
@@ -47,6 +54,7 @@ use mach2::port::*;
 use mach2::thread_act::*;
 use mach2::thread_status::*;
 use mach2::traps::*;
+use std::io;
 use std::mem;
 use std::ptr::addr_of_mut;
 use std::thread;
@@ -60,6 +68,8 @@ static mut CHILD_OF_FORKED_PROCESS: bool = false;
 pub struct TrapHandler {
     thread: Option<thread::JoinHandle<()>>,
 }
+
+static mut PREV_SIGBUS: libc::sigaction = unsafe { mem::zeroed() };
 
 impl TrapHandler {
     pub unsafe fn new() -> TrapHandler {
@@ -86,6 +96,21 @@ impl TrapHandler {
         // we're not very interested in so it's detached here.
         let thread = thread::spawn(|| handler_thread());
 
+        // Setup a SIGBUS handler which is used for printing that the stack was
+        // overflowed when a host overflows its fiber stack.
+        unsafe {
+            let mut handler: libc::sigaction = mem::zeroed();
+            handler.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+            handler.sa_sigaction = sigbus_handler as usize;
+            libc::sigemptyset(&mut handler.sa_mask);
+            if libc::sigaction(libc::SIGBUS, &handler, addr_of_mut!(PREV_SIGBUS)) != 0 {
+                panic!(
+                    "unable to install signal handler: {}",
+                    io::Error::last_os_error(),
+                );
+            }
+        }
+
         TrapHandler {
             thread: Some(thread),
         }
@@ -100,6 +125,35 @@ impl Drop for TrapHandler {
             self.thread.take().unwrap().join().unwrap();
         }
     }
+}
+
+unsafe extern "C" fn sigbus_handler(
+    signum: libc::c_int,
+    siginfo: *mut libc::siginfo_t,
+    context: *mut libc::c_void,
+) {
+    // If this is a faulting address within the async guard range listed within
+    // our tls storage then print a helpful message about it and abort.
+    // Otherwise forward to the previous SIGBUS handler, if any.
+    tls::with(|info| {
+        let info = match info {
+            Some(info) => info,
+            None => return,
+        };
+        let faulting_addr = (*siginfo).si_addr() as usize;
+        let start = info.async_guard_range.start;
+        let end = info.async_guard_range.end;
+        if start as usize <= faulting_addr && faulting_addr < end as usize {
+            super::signals::abort_stack_overflow();
+        }
+    });
+
+    super::signals::delegate_signal_to_previous_handler(
+        addr_of_mut!(PREV_SIGBUS),
+        signum,
+        siginfo,
+        context,
+    )
 }
 
 // Note that this is copied from Gecko at
@@ -166,7 +220,7 @@ unsafe fn handler_thread() {
             break;
         }
         if kret != KERN_SUCCESS {
-            eprintln!("mach_msg failed with {} ({0:x})", kret);
+            eprintln!("mach_msg failed with {kret} ({kret:x})");
             libc::abort();
         }
         if request.body.Head.msgh_id != EXCEPTION_MSG_ID {
@@ -384,21 +438,16 @@ unsafe fn handle_exception(request: &mut ExceptionRequest) -> bool {
 /// a native backtrace once we've switched back to the thread itself. After
 /// the backtrace is captured we can do the usual `longjmp` back to the source
 /// of the wasm code.
-unsafe extern "C" fn unwind(
-    wasm_pc: *const u8,
-    wasm_fp: usize,
-    fault1: usize,
-    fault2: usize,
-    trap: u8,
-) -> ! {
+unsafe extern "C" fn unwind(pc: usize, fp: usize, fault1: usize, fault2: usize, trap: u8) -> ! {
     let jmp_buf = tls::with(|state| {
         let state = state.unwrap();
+        let regs = TrapRegisters { pc, fp };
         let faulting_addr = match fault1 {
             0 => None,
             _ => Some(fault2),
         };
         let trap = Trap::from_u8(trap).unwrap();
-        state.set_jit_trap(wasm_pc, wasm_fp, faulting_addr, trap);
+        state.set_jit_trap(regs, faulting_addr, trap);
         state.take_jmp_buf()
     });
     debug_assert!(!jmp_buf.is_null());

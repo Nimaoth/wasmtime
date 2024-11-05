@@ -2,7 +2,7 @@
 
 pub use emit_state::EmitState;
 
-use crate::binemit::{Addend, CodeOffset, Reloc, StackMap};
+use crate::binemit::{Addend, CodeOffset, Reloc};
 use crate::ir::{types, ExternalName, LibCall, TrapCode, Type};
 use crate::isa::x64::abi::X64ABIMachineSpec;
 use crate::isa::x64::inst::regs::{pretty_print_reg, show_ireg_sized};
@@ -11,7 +11,6 @@ use crate::isa::{CallConv, FunctionAlignment};
 use crate::{machinst::*, trace};
 use crate::{settings, CodegenError, CodegenResult};
 use alloc::boxed::Box;
-use regalloc2::PRegSet;
 use smallvec::{smallvec, SmallVec};
 use std::fmt::{self, Write};
 use std::string::{String, ToString};
@@ -22,6 +21,7 @@ mod emit_state;
 #[cfg(test)]
 mod emit_tests;
 pub mod regs;
+mod stack_switch;
 pub mod unwind;
 
 use args::*;
@@ -32,26 +32,12 @@ use args::*;
 // `Inst` is defined inside ISLE as `MInst`. We publicly re-export it here.
 pub use super::lower::isle::generated_code::MInst as Inst;
 
-/// Out-of-line data for calls, to keep the size of `Inst` down.
-#[derive(Clone, Debug)]
-pub struct CallInfo {
-    /// Register uses of this call.
-    pub uses: CallArgList,
-    /// Register defs of this call.
-    pub defs: CallRetList,
-    /// Registers clobbered by this call, as per its calling convention.
-    pub clobbers: PRegSet,
-    /// The number of bytes that the callee will pop from the stack for the
-    /// caller, if any. (Used for popping stack arguments with the `tail`
-    /// calling convention.)
-    pub callee_pop_size: u32,
-    /// The calling convention of the callee.
-    pub callee_conv: CallConv,
-}
-
 /// Out-of-line data for return-calls, to keep the size of `Inst` down.
 #[derive(Clone, Debug)]
-pub struct ReturnCallInfo {
+pub struct ReturnCallInfo<T> {
+    /// Where this call is going.
+    pub dest: T,
+
     /// The size of the argument area for this return-call, potentially smaller than that of the
     /// caller, but never larger.
     pub new_stack_arg_size: u32,
@@ -137,6 +123,7 @@ impl Inst {
             | Inst::Setcc { .. }
             | Inst::ShiftR { .. }
             | Inst::SignExtendData { .. }
+            | Inst::StackSwitchBasic { .. }
             | Inst::TrapIf { .. }
             | Inst::TrapIfAnd { .. }
             | Inst::TrapIfOr { .. }
@@ -192,6 +179,8 @@ impl Inst {
             | Inst::GprToXmmVex { op, .. }
             | Inst::CvtIntToFloatVex { op, .. }
             | Inst::XmmCmpRmRVex { op, .. } => op.available_from(),
+
+            Inst::MulX { .. } => smallvec![InstructionSet::BMI2],
         }
     }
 }
@@ -536,45 +525,13 @@ impl Inst {
         Inst::Pop64 { dst }
     }
 
-    pub(crate) fn call_known(
-        dest: ExternalName,
-        uses: CallArgList,
-        defs: CallRetList,
-        clobbers: PRegSet,
-        callee_pop_size: u32,
-        callee_conv: CallConv,
-    ) -> Inst {
-        Inst::CallKnown {
-            dest,
-            info: Some(Box::new(CallInfo {
-                uses,
-                defs,
-                clobbers,
-                callee_pop_size,
-                callee_conv,
-            })),
-        }
+    pub(crate) fn call_known(info: Box<CallInfo<ExternalName>>) -> Inst {
+        Inst::CallKnown { info }
     }
 
-    pub(crate) fn call_unknown(
-        dest: RegMem,
-        uses: CallArgList,
-        defs: CallRetList,
-        clobbers: PRegSet,
-        callee_pop_size: u32,
-        callee_conv: CallConv,
-    ) -> Inst {
-        dest.assert_regclass_is(RegClass::Int);
-        Inst::CallUnknown {
-            dest,
-            info: Some(Box::new(CallInfo {
-                uses,
-                defs,
-                clobbers,
-                callee_pop_size,
-                callee_conv,
-            })),
-        }
+    pub(crate) fn call_unknown(info: Box<CallInfo<RegMem>>) -> Inst {
+        info.dest.assert_regclass_is(RegClass::Int);
+        Inst::CallUnknown { info }
     }
 
     pub(crate) fn ret(stack_bytes_to_pop: u32) -> Inst {
@@ -618,10 +575,9 @@ impl Inst {
                         ExtKind::ZeroExtend => {
                             Inst::movzx_rm_r(ext_mode, RegMem::mem(from_addr), to_reg)
                         }
-                        ExtKind::None => panic!(
-                            "expected an extension kind for extension mode: {:?}",
-                            ext_mode
-                        ),
+                        ExtKind::None => {
+                            panic!("expected an extension kind for extension mode: {ext_mode:?}")
+                        }
                     }
                 } else {
                     // 64-bit values can be moved directly.
@@ -866,6 +822,26 @@ impl PrettyPrint for Inst {
                 } else {
                     format!("mul{suffix}")
                 });
+                format!("{op} {src1}, {src2}, {dst_lo}, {dst_hi}")
+            }
+
+            Inst::MulX {
+                size,
+                src1,
+                src2,
+                dst_lo,
+                dst_hi,
+            } => {
+                let src1 = pretty_print_reg(src1.to_reg(), size.to_bytes());
+                let dst_hi = pretty_print_reg(dst_hi.to_reg().to_reg(), size.to_bytes());
+                let dst_lo = if dst_lo.to_reg().is_invalid_sentinel() {
+                    dst_hi.clone()
+                } else {
+                    pretty_print_reg(dst_lo.to_reg().to_reg(), size.to_bytes())
+                };
+                let src2 = src2.pretty_print(size.to_bytes());
+                let suffix = suffix_bwlq(*size);
+                let op = ljustify(format!("mulx{suffix}"));
                 format!("{op} {src1}, {src2}, {dst_lo}, {dst_hi}")
             }
 
@@ -1659,26 +1635,26 @@ impl PrettyPrint for Inst {
                 format!("{op} {dst}")
             }
 
-            Inst::CallKnown { dest, .. } => {
+            Inst::CallKnown { info } => {
                 let op = ljustify("call".to_string());
-                format!("{op} {dest:?}")
+                format!("{op} {:?}", info.dest)
             }
 
-            Inst::CallUnknown { dest, .. } => {
-                let dest = dest.pretty_print(8);
+            Inst::CallUnknown { info } => {
+                let dest = info.dest.pretty_print(8);
                 let op = ljustify("call".to_string());
                 format!("{op} *{dest}")
             }
 
-            Inst::ReturnCallKnown { callee, info } => {
+            Inst::ReturnCallKnown { info } => {
                 let ReturnCallInfo {
                     uses,
                     new_stack_arg_size,
                     tmp,
+                    dest,
                 } = &**info;
                 let tmp = pretty_print_reg(tmp.to_reg().to_reg(), 8);
-                let mut s =
-                    format!("return_call_known {callee:?} ({new_stack_arg_size}) tmp={tmp}");
+                let mut s = format!("return_call_known {dest:?} ({new_stack_arg_size}) tmp={tmp}");
                 for ret in uses {
                     let preg = regs::show_reg(ret.preg);
                     let vreg = pretty_print_reg(ret.vreg, 8);
@@ -1687,13 +1663,14 @@ impl PrettyPrint for Inst {
                 s
             }
 
-            Inst::ReturnCallUnknown { callee, info } => {
+            Inst::ReturnCallUnknown { info } => {
                 let ReturnCallInfo {
                     uses,
                     new_stack_arg_size,
                     tmp,
+                    dest,
                 } = &**info;
-                let callee = pretty_print_reg(*callee, 8);
+                let callee = pretty_print_reg(*dest, 8);
                 let tmp = pretty_print_reg(tmp.to_reg().to_reg(), 8);
                 let mut s =
                     format!("return_call_unknown {callee} ({new_stack_arg_size}) tmp={tmp}");
@@ -1731,6 +1708,19 @@ impl PrettyPrint for Inst {
                     write!(&mut s, " {stack_bytes_to_pop}").unwrap();
                 }
                 s
+            }
+
+            Inst::StackSwitchBasic {
+                store_context_ptr,
+                load_context_ptr,
+                in_payload0,
+                out_payload0,
+            } => {
+                let store_context_ptr = pretty_print_reg(**store_context_ptr, 8);
+                let load_context_ptr = pretty_print_reg(**load_context_ptr, 8);
+                let in_payload0 = pretty_print_reg(**in_payload0, 8);
+                let out_payload0 = pretty_print_reg(*out_payload0.to_reg(), 8);
+                format!("{out_payload0} = stack_switch_basic {store_context_ptr}, {load_context_ptr}, {in_payload0}")
             }
 
             Inst::JmpKnown { dst } => {
@@ -2000,6 +1990,20 @@ fn x64_get_operands(inst: &mut Inst, collector: &mut impl OperandVisitor) {
         Inst::IMulImm { src1, dst, .. } => {
             collector.reg_def(dst);
             src1.get_operands(collector);
+        }
+        Inst::MulX {
+            src1,
+            src2,
+            dst_lo,
+            dst_hi,
+            ..
+        } => {
+            if !dst_lo.to_reg().is_invalid_sentinel() {
+                collector.reg_def(dst_lo);
+            }
+            collector.reg_def(dst_hi);
+            collector.reg_fixed_use(src1, regs::rdx());
+            src2.get_operands(collector);
         }
         Inst::SignExtendData { size, src, dst } => {
             match size {
@@ -2326,7 +2330,7 @@ fn x64_get_operands(inst: &mut Inst, collector: &mut impl OperandVisitor) {
             collector.reg_early_def(tmp);
         }
 
-        Inst::CallKnown { dest, info, .. } => {
+        Inst::CallKnown { info } => {
             // Probestack is special and is only inserted after
             // regalloc, so we do not need to represent its ABI to the
             // register allocator. Assert that we don't alter that
@@ -2335,8 +2339,9 @@ fn x64_get_operands(inst: &mut Inst, collector: &mut impl OperandVisitor) {
                 uses,
                 defs,
                 clobbers,
+                dest,
                 ..
-            } = &mut **info.as_mut().expect("CallInfo is expected in this path");
+            } = &mut **info;
             debug_assert_ne!(*dest, ExternalName::LibCall(LibCall::Probestack));
             for CallArgPair { vreg, preg } in uses {
                 collector.reg_fixed_use(vreg, *preg);
@@ -2347,14 +2352,15 @@ fn x64_get_operands(inst: &mut Inst, collector: &mut impl OperandVisitor) {
             collector.reg_clobbers(*clobbers);
         }
 
-        Inst::CallUnknown { info, dest, .. } => {
+        Inst::CallUnknown { info } => {
             let CallInfo {
                 uses,
                 defs,
                 clobbers,
                 callee_conv,
+                dest,
                 ..
-            } = &mut **info.as_mut().expect("CallInfo is expected in this path");
+            } = &mut **info;
             match dest {
                 RegMem::Reg { reg } if *callee_conv == CallConv::Winch => {
                     // TODO(https://github.com/bytecodealliance/regalloc2/issues/145):
@@ -2372,26 +2378,51 @@ fn x64_get_operands(inst: &mut Inst, collector: &mut impl OperandVisitor) {
             }
             collector.reg_clobbers(*clobbers);
         }
+        Inst::StackSwitchBasic {
+            store_context_ptr,
+            load_context_ptr,
+            in_payload0,
+            out_payload0,
+        } => {
+            collector.reg_use(load_context_ptr);
+            collector.reg_use(store_context_ptr);
+            collector.reg_fixed_use(in_payload0, stack_switch::payload_register());
+            collector.reg_fixed_def(out_payload0, stack_switch::payload_register());
 
-        Inst::ReturnCallKnown { callee, info } => {
-            let ReturnCallInfo { uses, tmp, .. } = &mut **info;
+            let mut clobbers = crate::isa::x64::abi::ALL_CLOBBERS;
+            // The return/payload reg must not be included in the clobber set
+            clobbers.remove(
+                stack_switch::payload_register()
+                    .to_real_reg()
+                    .unwrap()
+                    .into(),
+            );
+            collector.reg_clobbers(clobbers);
+        }
+
+        Inst::ReturnCallKnown { info } => {
+            let ReturnCallInfo {
+                dest, uses, tmp, ..
+            } = &mut **info;
             collector.reg_fixed_def(tmp, regs::r11());
             // Same as in the `Inst::CallKnown` branch.
-            debug_assert_ne!(*callee, ExternalName::LibCall(LibCall::Probestack));
+            debug_assert_ne!(*dest, ExternalName::LibCall(LibCall::Probestack));
             for CallArgPair { vreg, preg } in uses {
                 collector.reg_fixed_use(vreg, *preg);
             }
         }
 
-        Inst::ReturnCallUnknown { callee, info } => {
-            let ReturnCallInfo { uses, tmp, .. } = &mut **info;
+        Inst::ReturnCallUnknown { info } => {
+            let ReturnCallInfo {
+                dest, uses, tmp, ..
+            } = &mut **info;
 
             // TODO(https://github.com/bytecodealliance/regalloc2/issues/145):
             // This shouldn't be a fixed register constraint, but it's not clear how to
             // pick a register that won't be clobbered by the callee-save restore code
             // emitted with a return_call_indirect. r10 is caller-saved, so this should be
             // safe to use.
-            collector.reg_fixed_use(callee, regs::r10());
+            collector.reg_fixed_use(dest, regs::r10());
 
             collector.reg_fixed_def(tmp, regs::r11());
             for CallArgPair { vreg, preg } in uses {
@@ -2629,8 +2660,6 @@ impl MachInst for Inst {
             types::I16 => Ok((&[RegClass::Int], &[types::I16])),
             types::I32 => Ok((&[RegClass::Int], &[types::I32])),
             types::I64 => Ok((&[RegClass::Int], &[types::I64])),
-            types::R32 => panic!("32-bit reftype pointer should never be seen on x86-64"),
-            types::R64 => Ok((&[RegClass::Int], &[types::R64])),
             types::F16 => Ok((&[RegClass::Float], &[types::F16])),
             types::F32 => Ok((&[RegClass::Float], &[types::F32])),
             types::F64 => Ok((&[RegClass::Float], &[types::F64])),
@@ -2641,8 +2670,7 @@ impl MachInst for Inst {
                 Ok((&[RegClass::Float], &[types::I8X16]))
             }
             _ => Err(CodegenError::Unsupported(format!(
-                "Unexpected SSA-value type: {}",
-                ty
+                "Unexpected SSA-value type: {ty}"
             ))),
         }
     }

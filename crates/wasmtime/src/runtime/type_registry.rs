@@ -3,9 +3,10 @@
 //! Helps implement fast indirect call signature checking, reference type
 //! downcasting, and etc...
 
+use crate::hash_set::HashSet;
 use crate::prelude::*;
 use crate::sync::RwLock;
-use crate::vm::{GcLayout, GcRuntime};
+use crate::vm::GcRuntime;
 use crate::Engine;
 use alloc::borrow::Cow;
 use alloc::sync::Arc;
@@ -20,12 +21,11 @@ use core::{
         Ordering::{AcqRel, Acquire, Release},
     },
 };
-use hashbrown::HashSet;
 use wasmtime_environ::{
     iter_entity_range,
     packed_option::{PackedOption, ReservedValue},
-    EngineOrModuleTypeIndex, ModuleInternedTypeIndex, ModuleTypes, PrimaryMap, SecondaryMap,
-    TypeTrace, VMSharedTypeIndex, WasmRecGroup, WasmSubType,
+    EngineOrModuleTypeIndex, GcLayout, ModuleInternedTypeIndex, ModuleTypes, PrimaryMap,
+    SecondaryMap, TypeTrace, VMSharedTypeIndex, WasmRecGroup, WasmSubType,
 };
 use wasmtime_slab::{Id as SlabId, Slab};
 
@@ -437,9 +437,6 @@ struct RecGroupEntryInner {
     /// This flag exists to detect and avoid double-unregistration bugs that
     /// could otherwise occur in rare cases. See the comments in
     /// `TypeRegistryInner::unregister_type` for details.
-    ///
-    /// To maintain consistency with the rest of this entry's state, this flag
-    /// should only be accessed while holding the type registry lock.
     unregistered: AtomicBool,
 }
 
@@ -679,6 +676,17 @@ impl TypeRegistryInner {
             })
             .collect();
 
+        debug_assert_eq!(
+            shared_type_indices.len(),
+            shared_type_indices
+                .iter()
+                .copied()
+                .inspect(|ty| assert!(!ty.is_reserved_value()))
+                .collect::<crate::hash_set::HashSet<_>>()
+                .len(),
+            "should not have any duplicate type indices",
+        );
+
         let entry = RecGroupEntry(Arc::new(RecGroupEntryInner {
             hash_consing_key,
             shared_type_indices,
@@ -779,10 +787,10 @@ impl TypeRegistryInner {
         let gc_layout = match &ty.composite_type {
             wasmtime_environ::WasmCompositeType::Func(_) => None,
             wasmtime_environ::WasmCompositeType::Array(a) => {
-                Some(gc_runtime.array_layout(a).into())
+                Some(gc_runtime.layouts().array_layout(a).into())
             }
             wasmtime_environ::WasmCompositeType::Struct(s) => {
-                Some(gc_runtime.struct_layout(s).into())
+                Some(gc_runtime.layouts().struct_layout(s).into())
             }
         };
 
@@ -1033,6 +1041,18 @@ impl TypeRegistryInner {
             // map. Additionally, stop holding a strong reference from each
             // function type in the rec group to that function type's trampoline
             // type.
+            debug_assert_eq!(
+                entry.0.shared_type_indices.len(),
+                entry
+                    .0
+                    .shared_type_indices
+                    .iter()
+                    .copied()
+                    .inspect(|ty| assert!(!ty.is_reserved_value()))
+                    .collect::<crate::hash_set::HashSet<_>>()
+                    .len(),
+                "should not have any duplicate type indices",
+            );
             for ty in entry.0.shared_type_indices.iter().copied() {
                 log::trace!("removing {ty:?} from registry");
 

@@ -6,16 +6,13 @@ use std::cell::Cell;
 
 pub use super::MachLabel;
 use super::RetPair;
-pub use crate::ir::{
-    condcodes::CondCode, dynamic_to_fixed, Constant, DynamicStackSlot, ExternalName, FuncRef,
-    GlobalValue, Immediate, SigRef, StackSlot,
-};
+pub use crate::ir::{condcodes::CondCode, *};
 pub use crate::isa::{unwind::UnwindInst, TargetIsa};
 pub use crate::machinst::{
     ABIArg, ABIArgSlot, ABIMachineSpec, CallSite, InputSourceInst, Lower, LowerBackend, RealReg,
     Reg, RelocDistance, Sig, VCodeInst, Writable,
 };
-pub use crate::settings::TlsModel;
+pub use crate::settings::{StackSwitchModel, TlsModel};
 
 pub type Unit = ();
 pub type ValueSlice = (ValueList, usize);
@@ -45,7 +42,10 @@ pub enum RangeView {
 #[doc(hidden)]
 macro_rules! isle_lower_prelude_methods {
     () => {
-        isle_common_prelude_methods!();
+        crate::isle_lower_prelude_methods!(MInst);
+    };
+    ($inst:ty) => {
+        crate::isle_common_prelude_methods!();
 
         #[inline]
         fn value_type(&mut self, val: Value) -> Type {
@@ -341,6 +341,11 @@ macro_rules! isle_lower_prelude_methods {
         }
 
         #[inline]
+        fn stack_switch_model(&mut self) -> Option<StackSwitchModel> {
+            Some(self.backend.flags().stack_switch_model())
+        }
+
+        #[inline]
         fn func_ref_data(&mut self, func_ref: FuncRef) -> (SigRef, ExternalName, RelocDistance) {
             let funcdata = &self.lower_ctx.dfg().ext_funcs[func_ref];
             let reloc_distance = if funcdata.colocated {
@@ -486,24 +491,6 @@ macro_rules! isle_lower_prelude_methods {
             }
         }
 
-        fn abi_arg_struct_pointer(&mut self, arg: &ABIArg) -> Option<(ABIArgSlot, i64, u64)> {
-            match arg {
-                &ABIArg::StructArg {
-                    pointer,
-                    offset,
-                    size,
-                    ..
-                } => {
-                    if let Some(pointer) = pointer {
-                        Some((pointer, offset, size))
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            }
-        }
-
         fn abi_arg_implicit_pointer(&mut self, arg: &ABIArg) -> Option<(ABIArgSlot, i64, Type)> {
             match arg {
                 &ABIArg::ImplicitPtrArg {
@@ -530,6 +517,7 @@ macro_rules! isle_lower_prelude_methods {
             self.lower_ctx
                 .abi()
                 .sized_stackslot_addr(stack_slot, offset, dst)
+                .into()
         }
 
         fn abi_dynamic_stackslot_addr(
@@ -542,7 +530,10 @@ macro_rules! isle_lower_prelude_methods {
                 .abi()
                 .dynamic_stackslot_offsets()
                 .is_valid(stack_slot));
-            self.lower_ctx.abi().dynamic_stackslot_addr(stack_slot, dst)
+            self.lower_ctx
+                .abi()
+                .dynamic_stackslot_addr(stack_slot, dst)
+                .into()
         }
 
         fn real_reg_to_reg(&mut self, reg: RealReg) -> Reg {
@@ -597,7 +588,7 @@ macro_rules! isle_lower_prelude_methods {
 
         #[inline]
         fn gen_move(&mut self, ty: Type, dst: WritableReg, src: Reg) -> MInst {
-            MInst::gen_move(dst, src, ty)
+            <$inst>::gen_move(dst, src, ty).into()
         }
 
         /// Generate the return instruction.
@@ -715,6 +706,10 @@ macro_rules! isle_lower_prelude_methods {
             self.lower_ctx.add_range_fact(reg, bits, min, max);
             reg
         }
+
+        fn value_is_unused(&mut self, val: Value) -> bool {
+            self.lower_ctx.value_is_unused(val)
+        }
     };
 }
 
@@ -758,7 +753,7 @@ pub fn shuffle_imm_as_le_lane_idx(size: u8, bytes: &[u8]) -> Option<u8> {
 #[macro_export]
 #[doc(hidden)]
 macro_rules! isle_prelude_caller_methods {
-    ($abispec:ty, $abicaller:ty) => {
+    ($abicaller:ty) => {
         fn gen_call(
             &mut self,
             sig_ref: SigRef,
@@ -812,6 +807,62 @@ macro_rules! isle_prelude_caller_methods {
             );
 
             crate::machinst::isle::gen_call_common(&mut self.lower_ctx, num_rets, caller, args)
+        }
+
+        fn gen_return_call(
+            &mut self,
+            callee_sig: SigRef,
+            callee: ExternalName,
+            distance: RelocDistance,
+            args: ValueSlice,
+        ) -> InstOutput {
+            let caller_conv = isa::CallConv::Tail;
+            debug_assert_eq!(
+                self.lower_ctx.abi().call_conv(self.lower_ctx.sigs()),
+                caller_conv,
+                "Can only do `return_call`s from within a `tail` calling convention function"
+            );
+
+            let call_site = <$abicaller>::from_func(
+                self.lower_ctx.sigs(),
+                callee_sig,
+                &callee,
+                IsTailCall::Yes,
+                distance,
+                caller_conv,
+                self.backend.flags().clone(),
+            );
+            call_site.emit_return_call(self.lower_ctx, args, self.backend);
+
+            InstOutput::new()
+        }
+
+        fn gen_return_call_indirect(
+            &mut self,
+            callee_sig: SigRef,
+            callee: Value,
+            args: ValueSlice,
+        ) -> InstOutput {
+            let caller_conv = isa::CallConv::Tail;
+            debug_assert_eq!(
+                self.lower_ctx.abi().call_conv(self.lower_ctx.sigs()),
+                caller_conv,
+                "Can only do `return_call`s from within a `tail` calling convention function"
+            );
+
+            let callee = self.put_in_reg(callee);
+
+            let call_site = <$abicaller>::from_ptr(
+                self.lower_ctx.sigs(),
+                callee_sig,
+                callee,
+                IsTailCall::Yes,
+                caller_conv,
+                self.backend.flags().clone(),
+            );
+            call_site.emit_return_call(self.lower_ctx, args, self.backend);
+
+            InstOutput::new()
         }
     };
 }

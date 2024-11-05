@@ -47,6 +47,7 @@ pub struct Engine {
 
 struct EngineInner {
     config: Config,
+    features: WasmFeatures,
     tunables: Tunables,
     #[cfg(any(feature = "cranelift", feature = "winch"))]
     compiler: Box<dyn wasmtime_environ::Compiler>,
@@ -87,8 +88,11 @@ impl Engine {
     /// to `true`, but explicitly disable these two compiler settings
     /// will cause errors.
     pub fn new(config: &Config) -> Result<Engine> {
+        let config = config.clone();
+        let (tunables, features) = config.validate()?;
+
         #[cfg(feature = "runtime")]
-        {
+        if tunables.signals_based_traps {
             // Ensure that crate::runtime::vm's signal handlers are
             // configured. This is the per-program initialization required for
             // handling traps, such as configuring signals, vectored exception
@@ -98,11 +102,8 @@ impl Engine {
             crate::runtime::vm::debug_builtins::ensure_exported();
         }
 
-        let config = config.clone();
-        let tunables = config.validate()?;
-
         #[cfg(any(feature = "cranelift", feature = "winch"))]
-        let (config, compiler) = config.build_compiler(&tunables)?;
+        let (config, compiler) = config.build_compiler(&tunables, features)?;
 
         Ok(Engine {
             inner: Arc::new(EngineInner {
@@ -122,6 +123,7 @@ impl Engine {
                 compatible_with_native_host: OnceLock::new(),
                 config,
                 tunables,
+                features,
             }),
         })
     }
@@ -130,6 +132,11 @@ impl Engine {
     #[inline]
     pub fn config(&self) -> &Config {
         &self.inner.config
+    }
+
+    #[inline]
+    pub(crate) fn features(&self) -> WasmFeatures {
+        self.inner.features
     }
 
     pub(crate) fn run_maybe_parallel<
@@ -176,6 +183,13 @@ impl Engine {
     #[inline]
     pub fn same(a: &Engine, b: &Engine) -> bool {
         Arc::ptr_eq(&a.inner, &b.inner)
+    }
+
+    /// Returns whether the engine is configured to support async functions.
+    #[cfg(feature = "async")]
+    #[inline]
+    pub fn is_async(&self) -> bool {
+        self.config().async_support
     }
 
     /// Detects whether the bytes provided are a precompiled object produced by
@@ -247,8 +261,7 @@ impl Engine {
             let target = compiler.triple();
             if *target != target_lexicon::Triple::host() {
                 return Err(format!(
-                    "target '{}' specified in the configuration does not match the host",
-                    target
+                    "target '{target}' specified in the configuration does not match the host"
                 ));
             }
 
@@ -308,7 +321,7 @@ impl Engine {
             // like typed function references and GC) are enabled this must be
             // enabled, otherwise this setting can have any value.
             "enable_safepoints" => {
-                if self.config().features.contains(WasmFeatures::REFERENCE_TYPES) {
+                if self.features().contains(WasmFeatures::REFERENCE_TYPES) {
                     *value == FlagValue::Bool(true)
                 } else {
                     return Ok(())
@@ -340,6 +353,7 @@ impl Engine {
             | "bb_padding_log2_minus_one"
             | "machine_code_cfg_info"
             | "tls_model" // wasmtime doesn't use tls right now
+            | "stack_switch_model" // wasmtime doesn't use stack switching right now
             | "opt_level" // opt level doesn't change semantics
             | "enable_alias_analysis" // alias analysis-based opts don't change semantics
             | "probestack_size_log2" // probestack above asserted disabled
@@ -350,14 +364,13 @@ impl Engine {
             // Everything else is unknown and needs to be added somewhere to
             // this list if encountered.
             _ => {
-                return Err(format!("unknown shared setting {:?} configured to {:?}", flag, value))
+                return Err(format!("unknown shared setting {flag:?} configured to {value:?}"))
             }
         };
 
         if !ok {
             return Err(format!(
-                "setting {:?} is configured to {:?} which is not supported",
-                flag, value,
+                "setting {flag:?} is configured to {value:?} which is not supported",
             ));
         }
         Ok(())
@@ -384,8 +397,7 @@ impl Engine {
             // need more support here.
             _ => {
                 return Err(format!(
-                    "isa-specific feature {:?} configured to unknown value {:?}",
-                    flag, value
+                    "isa-specific feature {flag:?} configured to unknown value {value:?}"
                 ))
             }
         }
@@ -394,6 +406,7 @@ impl Engine {
             // aarch64 features to detect
             "has_lse" => "lse",
             "has_pauth" => "paca",
+            "has_fp16" => "fp16",
 
             // aarch64 features which don't need detection
             // No effect on its own.
@@ -497,7 +510,7 @@ impl Engine {
     /// [text]: https://webassembly.github.io/spec/core/text/index.html
     pub fn precompile_module(&self, bytes: &[u8]) -> Result<Vec<u8>> {
         crate::CodeBuilder::new(self)
-            .wasm(bytes, None)?
+            .wasm_binary_or_text(bytes, None)?
             .compile_module_serialized()
     }
 
@@ -506,7 +519,7 @@ impl Engine {
     #[cfg(feature = "component-model")]
     pub fn precompile_component(&self, bytes: &[u8]) -> Result<Vec<u8>> {
         crate::CodeBuilder::new(self)
-            .wasm(bytes, None)?
+            .wasm_binary_or_text(bytes, None)?
             .compile_component_serialized()
     }
 

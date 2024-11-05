@@ -50,7 +50,7 @@ impl DiffEngine for V8Engine {
         let mut isolate = self.isolate.borrow_mut();
         let isolate = &mut **isolate;
         let mut scope = v8::HandleScope::new(isolate);
-        let context = v8::Context::new(&mut scope);
+        let context = v8::Context::new(&mut scope, Default::default());
         let global = context.global(&mut scope);
         let mut scope = v8::ContextScope::new(&mut scope, context);
 
@@ -80,14 +80,12 @@ impl DiffEngine for V8Engine {
         let v8 = err.to_string();
         let wasmtime_msg = wasmtime.to_string();
         let verify_wasmtime = |msg: &str| {
-            assert!(wasmtime_msg.contains(msg), "{}\n!=\n{}", wasmtime_msg, v8);
+            assert!(wasmtime_msg.contains(msg), "{wasmtime_msg}\n!=\n{v8}");
         };
         let verify_v8 = |msg: &[&str]| {
             assert!(
                 msg.iter().any(|msg| v8.contains(msg)),
-                "{:?}\n\t!=\n{}",
-                wasmtime_msg,
-                v8
+                "{wasmtime_msg:?}\n\t!=\n{v8}"
             );
         };
         match wasmtime {

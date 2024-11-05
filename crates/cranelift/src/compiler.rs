@@ -1,20 +1,21 @@
 use crate::debug::DwarfSectionRelocTarget;
 use crate::func_environ::FuncEnvironment;
-use crate::DEBUG_ASSERT_TRAP_CODE;
+use crate::translate::{FuncEnvironment as _, FuncTranslator};
+use crate::TRAP_INTERNAL_ASSERT;
 use crate::{array_call_signature, CompiledFunction, ModuleTextBuilder};
 use crate::{builder::LinkOptions, wasm_call_signature, BuiltinFunctionSignatures};
 use anyhow::{Context as _, Result};
+use cranelift_codegen::binemit::CodeOffset;
+use cranelift_codegen::bitset::CompoundBitSet;
 use cranelift_codegen::ir::{self, InstBuilder, MemFlags, UserExternalName, UserFuncName, Value};
 use cranelift_codegen::isa::{
     unwind::{UnwindInfo, UnwindInfoKind},
     OwnedTargetIsa, TargetIsa,
 };
 use cranelift_codegen::print_errors::pretty_error;
-use cranelift_codegen::Context;
-use cranelift_codegen::{CompiledCode, MachStackMap};
+use cranelift_codegen::{CompiledCode, Context};
 use cranelift_entity::PrimaryMap;
 use cranelift_frontend::FunctionBuilder;
-use cranelift_wasm::{DefinedFuncIndex, FuncTranslator, WasmFuncType, WasmValType};
 use object::write::{Object, StandardSegment, SymbolId};
 use object::{RelocationEncoding, RelocationFlags, RelocationKind, SectionKind};
 use std::any::Any;
@@ -25,10 +26,10 @@ use std::path;
 use std::sync::{Arc, Mutex};
 use wasmparser::{FuncValidatorAllocations, FunctionBody};
 use wasmtime_environ::{
-    AddressMapSection, BuiltinFunctionIndex, CacheStore, CompileError, FlagValue, FunctionBodyData,
-    FunctionLoc, ModuleTranslation, ModuleTypesBuilder, PtrSize, RelocationTarget,
-    StackMapInformation, StaticModuleIndex, TrapEncodingBuilder, Tunables, VMOffsets,
-    WasmFunctionInfo,
+    AddressMapSection, BuiltinFunctionIndex, CacheStore, CompileError, DefinedFuncIndex, FlagValue,
+    FunctionBodyData, FunctionLoc, ModuleTranslation, ModuleTypesBuilder, PtrSize,
+    RelocationTarget, StackMapInformation, StaticModuleIndex, TrapEncodingBuilder, Tunables,
+    VMOffsets, WasmFuncType, WasmFunctionInfo, WasmValType,
 };
 
 #[cfg(feature = "component-model")]
@@ -147,8 +148,14 @@ impl wasmtime_environ::Compiler for Compiler {
             context.func.collect_debug_info();
         }
 
-        let mut func_env =
-            FuncEnvironment::new(isa, translation, types, &self.tunables, self.wmemcheck);
+        let mut func_env = FuncEnvironment::new(
+            isa,
+            translation,
+            types,
+            &self.tunables,
+            self.wmemcheck,
+            wasm_func_ty,
+        );
 
         // The `stack_limit` global value below is the implementation of stack
         // overflow checks in Wasmtime.
@@ -193,13 +200,15 @@ impl wasmtime_environ::Compiler for Compiler {
         });
         let stack_limit = context.func.create_global_value(ir::GlobalValueData::Load {
             base: interrupts_ptr,
-            offset: i32::try_from(func_env.offsets.ptr.vmruntime_limits_stack_limit())
-                .unwrap()
-                .into(),
+            offset: i32::from(func_env.offsets.ptr.vmruntime_limits_stack_limit()).into(),
             global_type: isa.pointer_type(),
             flags: MemFlags::trusted(),
         });
-        context.func.stack_limit = Some(stack_limit);
+        if func_env.signals_based_traps() {
+            context.func.stack_limit = Some(stack_limit);
+        } else {
+            func_env.stack_limit_at_function_entry = Some(stack_limit);
+        }
         let FunctionBodyData { validator, body } = input;
         let mut validator =
             validator.into_validator(mem::take(&mut compiler.cx.validator_allocations));
@@ -330,7 +339,7 @@ impl wasmtime_environ::Compiler for Compiler {
             pointer_type,
             MemFlags::trusted(),
             caller_vmctx,
-            i32::try_from(ptr.vmcontext_runtime_limits()).unwrap(),
+            i32::from(ptr.vmcontext_runtime_limits()),
         );
         save_last_wasm_exit_fp_and_pc(&mut builder, pointer_type, &ptr, limits);
 
@@ -535,7 +544,7 @@ impl wasmtime_environ::Compiler for Compiler {
             pointer_type,
             mem_flags,
             vmctx,
-            i32::try_from(ptr_size.vmcontext_builtin_functions()).unwrap(),
+            i32::from(ptr_size.vmcontext_builtin_functions()),
         );
         let body_offset = i32::try_from(index.index() * pointer_type.bytes()).unwrap();
         let func_addr = builder
@@ -582,14 +591,14 @@ mod incremental_cache {
         context: &'a mut Context,
         isa: &dyn TargetIsa,
         cache_ctx: Option<&mut IncrementalCacheContext>,
-    ) -> Result<(&'a CompiledCode, Vec<u8>), CompileError> {
+    ) -> Result<CompiledCode, CompileError> {
         let cache_ctx = match cache_ctx {
             Some(ctx) => ctx,
             None => return compile_uncached(context, isa),
         };
 
         let mut cache_store = CraneliftCacheStore(cache_ctx.cache_store.clone());
-        let (compiled_code, from_cache) = context
+        let (_compiled_code, from_cache) = context
             .compile_with_cache(isa, &mut cache_store, &mut Default::default())
             .map_err(|error| CompileError::Codegen(pretty_error(&error.func, error.inner)))?;
 
@@ -599,7 +608,7 @@ mod incremental_cache {
             cache_ctx.num_cached += 1;
         }
 
-        Ok((compiled_code, compiled_code.code_buffer().to_vec()))
+        Ok(context.take_compiled_code().unwrap())
     }
 }
 
@@ -611,19 +620,18 @@ fn compile_maybe_cached<'a>(
     context: &'a mut Context,
     isa: &dyn TargetIsa,
     _cache_ctx: Option<&mut IncrementalCacheContext>,
-) -> Result<(&'a CompiledCode, Vec<u8>), CompileError> {
+) -> Result<CompiledCode, CompileError> {
     compile_uncached(context, isa)
 }
 
 fn compile_uncached<'a>(
     context: &'a mut Context,
     isa: &dyn TargetIsa,
-) -> Result<(&'a CompiledCode, Vec<u8>), CompileError> {
-    let mut code_buf = Vec::new();
-    let compiled_code = context
-        .compile_and_emit(isa, &mut code_buf, &mut Default::default())
+) -> Result<CompiledCode, CompileError> {
+    context
+        .compile(isa, &mut Default::default())
         .map_err(|error| CompileError::Codegen(pretty_error(&error.func, error.inner)))?;
-    Ok((compiled_code, code_buf))
+    Ok(context.take_compiled_code().unwrap())
 }
 
 impl Compiler {
@@ -661,7 +669,7 @@ impl Compiler {
         {
             let values_vec_len = builder
                 .ins()
-                .iconst(ir::types::I32, i64::try_from(values_vec_len).unwrap());
+                .iconst(ir::types::I32, i64::from(values_vec_len));
             self.store_values_to_array(builder, ty.params(), args, values_vec_ptr, values_vec_len);
         }
 
@@ -695,11 +703,9 @@ impl Compiler {
             .with_endianness(ir::Endianness::Little);
 
         let value_size = mem::size_of::<u128>();
-        for (i, (val, ty)) in values.iter().copied().zip(types).enumerate() {
+        for (i, val) in values.iter().copied().enumerate() {
             crate::unbarriered_store_type_at_offset(
-                &*self.isa,
                 &mut builder.cursor(),
-                *ty,
                 flags,
                 values_vec_ptr,
                 i32::try_from(i * value_size).unwrap(),
@@ -803,9 +809,8 @@ impl FunctionCompiler<'_> {
     ) -> Result<(WasmFunctionInfo, CompiledFunction), CompileError> {
         let context = &mut self.cx.codegen_context;
         let isa = &*self.compiler.isa;
-        let (_, _code_buf) =
+        let mut compiled_code =
             compile_maybe_cached(context, isa, self.cx.incremental_cache_ctx.as_mut())?;
-        let mut compiled_code = context.take_compiled_code().unwrap();
 
         // Give wasm functions, user defined code, a "preferred" alignment
         // instead of the minimum alignment as this can help perf in niche
@@ -866,7 +871,7 @@ impl FunctionCompiler<'_> {
         }
 
         let stack_maps =
-            mach_stack_maps_to_stack_maps(compiled_code.buffer.take_stack_maps().into_iter());
+            clif_to_env_stack_maps(compiled_code.buffer.take_user_stack_maps().into_iter());
         compiled_function
             .set_sized_stack_slots(std::mem::take(&mut context.func.sized_stack_slots));
         self.compiler.contexts.lock().unwrap().push(self.cx);
@@ -881,23 +886,24 @@ impl FunctionCompiler<'_> {
     }
 }
 
-fn mach_stack_maps_to_stack_maps(
-    mach_stack_maps: impl ExactSizeIterator<Item = MachStackMap>,
+/// Convert from Cranelift's representation of a stack map to Wasmtime's
+/// compiler-agnostic representation.
+fn clif_to_env_stack_maps(
+    clif_stack_maps: impl ExactSizeIterator<Item = (CodeOffset, u32, ir::UserStackMap)>,
 ) -> Vec<StackMapInformation> {
-    // This is converting from Cranelift's representation of a stack map to
-    // Wasmtime's representation. They happen to align today but that may
-    // not always be true in the future.
-    let mut stack_maps = Vec::with_capacity(mach_stack_maps.len());
-    for MachStackMap {
-        offset_end,
-        stack_map,
-        ..
-    } in mach_stack_maps
-    {
-        let mapped_words = stack_map.mapped_words();
-        let stack_map = wasmtime_environ::StackMap::new(mapped_words, stack_map.into_bitset());
+    let mut stack_maps = Vec::with_capacity(clif_stack_maps.len());
+    for (code_offset, mapped_bytes, stack_map) in clif_stack_maps {
+        let mut bitset = CompoundBitSet::new();
+        for (ty, offset) in stack_map.entries() {
+            assert_eq!(ty, ir::types::I32);
+            bitset.insert(usize::try_from(offset).unwrap());
+        }
+        if bitset.is_empty() {
+            continue;
+        }
+        let stack_map = wasmtime_environ::StackMap::new(mapped_bytes, bitset);
         stack_maps.push(StackMapInformation {
-            code_offset: offset_end,
+            code_offset,
             stack_map,
         });
     }
@@ -937,9 +943,7 @@ fn debug_assert_enough_capacity_for_length(
             capacity,
             ir::immediates::Imm64::new(length.try_into().unwrap()),
         );
-        builder
-            .ins()
-            .trapz(enough_capacity, ir::TrapCode::User(DEBUG_ASSERT_TRAP_CODE));
+        builder.ins().trapz(enough_capacity, TRAP_INTERNAL_ASSERT);
     }
 }
 
@@ -961,10 +965,7 @@ fn debug_assert_vmctx_kind(
             magic,
             i64::from(expected_vmctx_magic),
         );
-        builder.ins().trapz(
-            is_expected_vmctx,
-            ir::TrapCode::User(DEBUG_ASSERT_TRAP_CODE),
-        );
+        builder.ins().trapz(is_expected_vmctx, TRAP_INTERNAL_ASSERT);
     }
 }
 

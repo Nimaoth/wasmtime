@@ -745,7 +745,7 @@ impl<'a> EgraphPass<'a> {
             self.func,
             &self.domtree,
             self.loop_analysis,
-            &mut self.remat_values,
+            &self.remat_values,
             &mut self.stats,
             self.ctrl_plane,
         );
@@ -769,7 +769,7 @@ impl<'a> EgraphPass<'a> {
                             debug_assert!(self.func.layout.inst_block(i).is_some());
                         }
                         ValueDef::Union(..) => {
-                            panic!("egraph union node {} still reachable at {}!", arg, inst);
+                            panic!("egraph union node {arg} still reachable at {inst}!");
                         }
                         _ => {}
                     })

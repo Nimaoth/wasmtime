@@ -143,6 +143,7 @@ pub mod __internal {
     pub use anyhow;
     #[cfg(feature = "async")]
     pub use async_trait::async_trait;
+    pub use core::mem::transmute;
     pub use wasmtime_environ;
     pub use wasmtime_environ::component::{CanonicalAbiInfo, ComponentTypes, InterfaceType};
 }
@@ -240,10 +241,18 @@ pub(crate) use self::store::ComponentStoreData;
 ///     ",
 ///
 ///     // Add calls to `tracing::span!` before each import or export is called
-///     // to log arguments and return values.
+///     // to log most arguments and return values. By default values
+///     // containing lists are excluded; enable `verbose_tracing` to include
+///     // them.
 ///     //
 ///     // This option defaults to `false`.
 ///     tracing: true,
+///
+///     // Include all arguments and return values in the tracing output,
+///     // including values containing lists, which may be very large.
+///     //
+///     // This option defaults to `false`.
+///     verbose_tracing: false,
 ///
 ///     // Imports will be async functions through #[async_trait] and exports
 ///     // are also invoked as async functions. Requires `Config::async_support`
@@ -512,6 +521,7 @@ pub use wasmtime_component_macro::bindgen;
 ///
 /// #[derive(ComponentType)]
 /// #[component(enum)]
+/// #[repr(u8)]
 /// enum Setting {
 ///     #[component(name = "yes")]
 ///     Yes,

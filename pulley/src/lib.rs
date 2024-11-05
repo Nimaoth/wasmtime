@@ -11,10 +11,6 @@ extern crate std;
 #[allow(unused_extern_crates)] // Some cfg's don't use this.
 extern crate alloc;
 
-// TODO: make `struct BinaryOpRegs<T> { dst: T, src1: T, src2: T }` or something
-// and pack it into 2 bytes (5 bits for each operand; 2**5 = 32 possible
-// registers, and then only special isntructions to access special x registers)
-
 /// Calls the given macro with each opcode.
 macro_rules! for_each_op {
     ( $macro:ident ) => {
@@ -49,6 +45,18 @@ macro_rules! for_each_op {
             br_if_xult32 = BrIfXult32 { a: XReg, b: XReg, offset: PcRelOffset };
             /// Branch if unsigned `a <= b`.
             br_if_xulteq32 = BrIfXulteq32 { a: XReg, b: XReg, offset: PcRelOffset };
+            /// Branch if `a == b`.
+            br_if_xeq64 = BrIfXeq64 { a: XReg, b: XReg, offset: PcRelOffset };
+            /// Branch if `a != `b.
+            br_if_xneq64 = BrIfXneq64 { a: XReg, b: XReg, offset: PcRelOffset };
+            /// Branch if signed `a < b`.
+            br_if_xslt64 = BrIfXslt64 { a: XReg, b: XReg, offset: PcRelOffset };
+            /// Branch if signed `a <= b`.
+            br_if_xslteq64 = BrIfXslteq64 { a: XReg, b: XReg, offset: PcRelOffset };
+            /// Branch if unsigned `a < b`.
+            br_if_xult64 = BrIfXult64 { a: XReg, b: XReg, offset: PcRelOffset };
+            /// Branch if unsigned `a <= b`.
+            br_if_xulteq64 = BrIfXulteq64 { a: XReg, b: XReg, offset: PcRelOffset };
 
             /// Move between `x` registers.
             xmov = Xmov { dst: XReg, src: XReg };
@@ -57,47 +65,47 @@ macro_rules! for_each_op {
             /// Move between `v` registers.
             vmov = Vmov { dst: VReg, src: VReg };
 
-            /// Set `dst = zero_extend(imm8)`.
-            xconst8 = Xconst8 { dst: XReg, imm: u8 };
-            /// Set `dst = zero_extend(imm16)`.
-            xconst16 = Xconst16 { dst: XReg, imm: u16 };
-            /// Set `dst = zero_extend(imm32)`.
-            xconst32 = Xconst32 { dst: XReg, imm: u32 };
+            /// Set `dst = sign_extend(imm8)`.
+            xconst8 = Xconst8 { dst: XReg, imm: i8 };
+            /// Set `dst = sign_extend(imm16)`.
+            xconst16 = Xconst16 { dst: XReg, imm: i16 };
+            /// Set `dst = sign_extend(imm32)`.
+            xconst32 = Xconst32 { dst: XReg, imm: i32 };
             /// Set `dst = imm64`.
-            xconst64 = Xconst64 { dst: XReg, imm: u64 };
+            xconst64 = Xconst64 { dst: XReg, imm: i64 };
 
             /// 32-bit wrapping addition: `low32(dst) = low32(src1) + low32(src2)`.
             ///
             /// The upper 32-bits of `dst` are unmodified.
-            xadd32 = Xadd32 { dst: XReg, src1: XReg, src2: XReg };
+            xadd32 = Xadd32 { operands: BinaryOperands<XReg> };
 
             /// 64-bit wrapping addition: `dst = src1 + src2`.
-            xadd64 = Xadd64 { dst: XReg, src1: XReg, src2: XReg };
+            xadd64 = Xadd64 { operands: BinaryOperands<XReg> };
 
             /// 64-bit equality.
-            xeq64 = Xeq64 { dst: XReg, src1: XReg, src2: XReg };
+            xeq64 = Xeq64 { operands: BinaryOperands<XReg> };
             /// 64-bit inequality.
-            xneq64 = Xneq64 { dst: XReg, src1: XReg, src2: XReg };
+            xneq64 = Xneq64 { operands: BinaryOperands<XReg> };
             /// 64-bit signed less-than.
-            xslt64 = Xslt64 { dst: XReg, src1: XReg, src2: XReg };
+            xslt64 = Xslt64 { operands: BinaryOperands<XReg> };
             /// 64-bit signed less-than-equal.
-            xslteq64 = Xslteq64 { dst: XReg, src1: XReg, src2: XReg };
+            xslteq64 = Xslteq64 { operands: BinaryOperands<XReg> };
             /// 64-bit unsigned less-than.
-            xult64 = Xult64 { dst: XReg, src1: XReg, src2: XReg };
+            xult64 = Xult64 { operands: BinaryOperands<XReg> };
             /// 64-bit unsigned less-than-equal.
-            xulteq64 = Xulteq64 { dst: XReg, src1: XReg, src2: XReg };
+            xulteq64 = Xulteq64 { operands: BinaryOperands<XReg> };
             /// 32-bit equality.
-            xeq32 = Xeq32 { dst: XReg, src1: XReg, src2: XReg };
+            xeq32 = Xeq32 { operands: BinaryOperands<XReg> };
             /// 32-bit inequality.
-            xneq32 = Xneq32 { dst: XReg, src1: XReg, src2: XReg };
+            xneq32 = Xneq32 { operands: BinaryOperands<XReg> };
             /// 32-bit signed less-than.
-            xslt32 = Xslt32 { dst: XReg, src1: XReg, src2: XReg };
+            xslt32 = Xslt32 { operands: BinaryOperands<XReg> };
             /// 32-bit signed less-than-equal.
-            xslteq32 = Xslteq32 { dst: XReg, src1: XReg, src2: XReg };
+            xslteq32 = Xslteq32 { operands: BinaryOperands<XReg> };
             /// 32-bit unsigned less-than.
-            xult32 = Xult32 { dst: XReg, src1: XReg, src2: XReg };
+            xult32 = Xult32 { operands: BinaryOperands<XReg> };
             /// 32-bit unsigned less-than-equal.
-            xulteq32 = Xulteq32 { dst: XReg, src1: XReg, src2: XReg };
+            xulteq32 = Xulteq32 { operands: BinaryOperands<XReg> };
 
             /// `dst = zero_extend(load32(ptr))`
             load32_u = Load32U { dst: XReg, ptr: XReg };
@@ -113,6 +121,13 @@ macro_rules! for_each_op {
             /// `dst = load64(ptr + offset8)`
             load64_offset8 = Load64Offset8 { dst: XReg, ptr: XReg, offset: i8 };
 
+            /// `dst = zero_extend(load32(ptr + offset64))`
+            load32_u_offset64 = Load32UOffset64 { dst: XReg, ptr: XReg, offset: i64 };
+            /// `dst = sign_extend(load32(ptr + offset64))`
+            load32_s_offset64 = Load32SOffset64 { dst: XReg, ptr: XReg, offset: i64 };
+            /// `dst = load64(ptr + offset64)`
+            load64_offset64 = Load64Offset64 { dst: XReg, ptr: XReg, offset: i64 };
+
             /// `*ptr = low32(src)`
             store32 = Store32 { ptr: XReg, src: XReg };
             /// `*ptr = src`
@@ -122,6 +137,34 @@ macro_rules! for_each_op {
             store32_offset8 = Store32SOffset8 { ptr: XReg, offset: i8, src: XReg };
             /// `*(ptr + sign_extend(offset8)) = src`
             store64_offset8 = Store64Offset8 { ptr: XReg, offset: i8, src: XReg };
+
+            /// `*(ptr + sign_extend(offset64)) = low32(src)`
+            store32_offset64 = Store32SOffset64 { ptr: XReg, offset: i64, src: XReg };
+            /// `*(ptr + sign_extend(offset64)) = src`
+            store64_offset64 = Store64Offset64 { ptr: XReg, offset: i64, src: XReg };
+
+            /// `push lr; push fp; fp = sp`
+            push_frame = PushFrame ;
+            /// `sp = fp; pop fp; pop lr`
+            pop_frame = PopFrame ;
+
+            /// `*sp = low32(src); sp += 4`
+            xpush32 = XPush32 { src: XReg };
+            /// `for src in srcs { xpush32 src }`
+            xpush32_many = XPush32Many { srcs: RegSet<XReg> };
+            /// `*sp = src; sp += 8`
+            xpush64 = XPush64 { src: XReg };
+            /// `for src in srcs { xpush64 src }`
+            xpush64_many = XPush64Many { srcs: RegSet<XReg> };
+
+            /// `*dst = *sp; sp -= 4`
+            xpop32 = XPop32 { dst: XReg };
+            /// `for dst in dsts.rev() { xpop32 dst }`
+            xpop32_many = XPop32Many { dsts: RegSet<XReg> };
+            /// `*dst = *sp; sp -= 8`
+            xpop64 = XPop64 { dst: XReg };
+            /// `for dst in dsts.rev() { xpop64 dst }`
+            xpop64_many = XPop64Many { dsts: RegSet<XReg> };
 
             /// `low32(dst) = bitcast low32(src) as i32`
             bitcast_int_from_float_32 = BitcastIntFromFloat32 { dst: XReg, src: FReg };

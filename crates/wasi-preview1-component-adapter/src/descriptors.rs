@@ -149,7 +149,7 @@ pub struct Descriptors {
 }
 
 #[cfg(not(feature = "proxy"))]
-#[link(wasm_import_module = "wasi:filesystem/preopens@0.2.0")]
+#[link(wasm_import_module = "wasi:filesystem/preopens@0.2.1")]
 extern "C" {
     #[link_name = "get-directories"]
     fn wasi_filesystem_get_directories(rval: *mut PreopenList);
@@ -266,7 +266,7 @@ impl Descriptors {
     fn push(&self, desc: Descriptor) -> Result<Fd, Errno> {
         unsafe {
             let table = (*self.table.get()).as_mut_ptr();
-            let len = usize::try_from(self.table_len.get()).trapping_unwrap();
+            let len = usize::from(self.table_len.get());
             if len >= (*table).len() {
                 return Err(wasi::ERRNO_NOMEM);
             }
@@ -280,7 +280,7 @@ impl Descriptors {
         unsafe {
             std::slice::from_raw_parts(
                 (*self.table.get()).as_ptr().cast(),
-                usize::try_from(self.table_len.get()).trapping_unwrap(),
+                usize::from(self.table_len.get()),
             )
         }
     }
@@ -289,7 +289,7 @@ impl Descriptors {
         unsafe {
             std::slice::from_raw_parts_mut(
                 (*self.table.get()).as_mut_ptr().cast(),
-                usize::try_from(self.table_len.get()).trapping_unwrap(),
+                usize::from(self.table_len.get()),
             )
         }
     }

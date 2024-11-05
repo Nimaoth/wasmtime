@@ -2,7 +2,7 @@
 
 // Pull in the ISLE generated code.
 pub(crate) mod generated_code;
-use crate::{ir::types, ir::AtomicRmwOp, isa, isle_common_prelude_methods};
+use crate::{ir::types, ir::AtomicRmwOp, isa};
 use generated_code::{Context, MInst, RegisterClass};
 
 // Types that the generated ISLE code uses via `use super::*`.
@@ -19,10 +19,10 @@ use crate::{
     },
     isa::x64::{
         abi::X64CallSite,
-        inst::{args::*, regs, CallInfo, ReturnCallInfo},
+        inst::{args::*, regs, ReturnCallInfo},
     },
     machinst::{
-        isle::*, ArgPair, InsnInput, InstOutput, IsTailCall, MachAtomicRmwOp, MachInst,
+        isle::*, ArgPair, CallInfo, InsnInput, InstOutput, IsTailCall, MachAtomicRmwOp, MachInst,
         VCodeConstant, VCodeConstantData,
     },
 };
@@ -34,8 +34,10 @@ use std::boxed::Box;
 /// call instruction is also used by Winch to emit calls, but the
 /// `Box<CallInfo>` field is not used, it's only used by Cranelift. By making it
 /// optional, we reduce the number of heap allocations in Winch.
-type BoxCallInfo = Option<Box<CallInfo>>;
-type BoxReturnCallInfo = Box<ReturnCallInfo>;
+type BoxCallInfo = Box<CallInfo<ExternalName>>;
+type BoxCallIndInfo = Box<CallInfo<RegMem>>;
+type BoxReturnCallInfo = Box<ReturnCallInfo<ExternalName>>;
+type BoxReturnCallIndInfo = Box<ReturnCallInfo<Reg>>;
 type VecArgPair = Vec<ArgPair>;
 
 pub struct SinkableLoad {
@@ -70,63 +72,7 @@ pub(crate) fn lower_branch(
 
 impl Context for IsleContext<'_, '_, MInst, X64Backend> {
     isle_lower_prelude_methods!();
-    isle_prelude_caller_methods!(X64ABIMachineSpec, X64CallSite);
-
-    fn gen_return_call_indirect(
-        &mut self,
-        callee_sig: SigRef,
-        callee: Value,
-        args: ValueSlice,
-    ) -> InstOutput {
-        let caller_conv = isa::CallConv::Tail;
-        debug_assert_eq!(
-            self.lower_ctx.abi().call_conv(self.lower_ctx.sigs()),
-            caller_conv,
-            "Can only do `return_call`s from within a `tail` calling convention function"
-        );
-
-        let callee = self.put_in_reg(callee);
-
-        let call_site = X64CallSite::from_ptr(
-            self.lower_ctx.sigs(),
-            callee_sig,
-            callee,
-            IsTailCall::Yes,
-            caller_conv,
-            self.backend.flags().clone(),
-        );
-        call_site.emit_return_call(self.lower_ctx, args);
-
-        InstOutput::new()
-    }
-
-    fn gen_return_call(
-        &mut self,
-        callee_sig: SigRef,
-        callee: ExternalName,
-        distance: RelocDistance,
-        args: ValueSlice,
-    ) -> InstOutput {
-        let caller_conv = isa::CallConv::Tail;
-        debug_assert_eq!(
-            self.lower_ctx.abi().call_conv(self.lower_ctx.sigs()),
-            caller_conv,
-            "Can only do `return_call`s from within a `tail` calling convention function"
-        );
-
-        let call_site = X64CallSite::from_func(
-            self.lower_ctx.sigs(),
-            callee_sig,
-            &callee,
-            IsTailCall::Yes,
-            distance,
-            caller_conv,
-            self.backend.flags().clone(),
-        );
-        call_site.emit_return_call(self.lower_ctx, args);
-
-        InstOutput::new()
-    }
+    isle_prelude_caller_methods!(X64CallSite);
 
     #[inline]
     fn operand_size_of_type_32_64(&mut self, ty: Type) -> OperandSize {
@@ -331,8 +277,7 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
     }
 
     fn sinkable_load(&mut self, val: Value) -> Option<SinkableLoad> {
-        let input = self.lower_ctx.get_value_as_source_or_const(val);
-        if let InputSourceInst::UniqueUse(inst, 0) = input.inst {
+        if let Some(inst) = self.is_sinkable_inst(val) {
             if let Some((addr_input, offset)) =
                 is_mergeable_load(self.lower_ctx, inst, MergeableLoadSize::Min32)
             {
@@ -347,8 +292,7 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
     }
 
     fn sinkable_load_exact(&mut self, val: Value) -> Option<SinkableLoad> {
-        let input = self.lower_ctx.get_value_as_source_or_const(val);
-        if let InputSourceInst::UniqueUse(inst, 0) = input.inst {
+        if let Some(inst) = self.is_sinkable_inst(val) {
             if let Some((addr_input, offset)) =
                 is_mergeable_load(self.lower_ctx, inst, MergeableLoadSize::Exact)
             {
@@ -609,8 +553,7 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
     #[inline]
     fn ty_int_bool_or_ref(&mut self, ty: Type) -> Option<()> {
         match ty {
-            types::I8 | types::I16 | types::I32 | types::I64 | types::R64 => Some(()),
-            types::R32 => panic!("shouldn't have 32-bits refs on x64"),
+            types::I8 | types::I16 | types::I32 | types::I64 => Some(()),
             _ => None,
         }
     }
@@ -990,6 +933,11 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
     fn insert_i8x16_lane_hole(&mut self, hole_idx: u8) -> VCodeConstant {
         let mask = -1i128 as u128;
         self.emit_u128_le_const(mask ^ (0xff << (hole_idx * 8)))
+    }
+
+    fn writable_invalid_gpr(&mut self) -> WritableGpr {
+        let reg = Gpr::new(self.invalid_reg()).unwrap();
+        WritableGpr::from_reg(reg)
     }
 }
 

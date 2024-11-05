@@ -3,7 +3,7 @@
 use anyhow::{bail, Result};
 use std::fs::File;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use tempfile::{NamedTempFile, TempDir};
 
@@ -21,13 +21,10 @@ pub fn run_wasmtime_for_output(args: &[&str], stdin: Option<&Path>) -> Result<Ou
 /// Get the Wasmtime CLI as a [Command].
 pub fn get_wasmtime_command() -> Result<Command> {
     // Figure out the Wasmtime binary from the current executable.
+    let bin = get_wasmtime_path()?;
     let runner = std::env::vars()
         .filter(|(k, _v)| k.starts_with("CARGO_TARGET") && k.ends_with("RUNNER"))
         .next();
-    let mut me = std::env::current_exe()?;
-    me.pop(); // chop off the file name
-    me.pop(); // chop off `deps`
-    me.push("wasmtime");
 
     // If we're running tests with a "runner" then we might be doing something
     // like cross-emulation, so spin up the emulator rather than the tests
@@ -38,10 +35,10 @@ pub fn get_wasmtime_command() -> Result<Command> {
         for arg in parts {
             cmd.arg(arg);
         }
-        cmd.arg(&me);
+        cmd.arg(&bin);
         cmd
     } else {
-        Command::new(&me)
+        Command::new(&bin)
     };
 
     // Ignore this if it's specified in the environment to allow tests to run in
@@ -49,6 +46,14 @@ pub fn get_wasmtime_command() -> Result<Command> {
     cmd.env_remove("WASMTIME_NEW_CLI");
 
     Ok(cmd)
+}
+
+fn get_wasmtime_path() -> Result<PathBuf> {
+    let mut path = std::env::current_exe()?;
+    path.pop(); // chop off the file name
+    path.pop(); // chop off `deps`
+    path.push("wasmtime");
+    Ok(path)
 }
 
 // Run the wasmtime CLI with the provided args and, if it succeeds, return
@@ -921,7 +926,7 @@ fn table_growth_failure2() -> Result<()> {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("forcing a table growth failure to be a trap"),
+        stderr.contains("forcing trap when growing table to 4294967296 elements"),
         "bad stderr: {stderr}"
     );
     Ok(())
@@ -1093,6 +1098,21 @@ fn mpk_without_pooling() -> Result<()> {
     Ok(())
 }
 
+// Very basic use case: compile binary wasm file and run specific function with arguments.
+#[test]
+fn increase_stack_size() -> Result<()> {
+    run_wasmtime(&[
+        "run",
+        "--invoke",
+        "simple",
+        &format!("-Wmax-wasm-stack={}", 5 << 20),
+        "-Ccache=n",
+        "tests/all/cli_tests/simple.wat",
+        "4",
+    ])?;
+    Ok(())
+}
+
 mod test_programs {
     use super::{get_wasmtime_command, run_wasmtime};
     use anyhow::{bail, Context, Result};
@@ -1137,6 +1157,27 @@ mod test_programs {
             "is an argument",
             "with 🚩 emoji",
         ])?;
+        Ok(())
+    }
+
+    #[test]
+    fn cli_stdin_empty() -> Result<()> {
+        let mut child = get_wasmtime_command()?
+            .args(&["run", "-Wcomponent-model", CLI_STDIN_EMPTY_COMPONENT])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::piped())
+            .spawn()?;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"not to be read")
+            .unwrap();
+        let output = child.wait_with_output()?;
+        println!("stdout: {}", String::from_utf8_lossy(&output.stdout));
+        println!("stderr: {}", String::from_utf8_lossy(&output.stderr));
+        assert!(output.status.success());
         Ok(())
     }
 
@@ -1440,6 +1481,28 @@ mod test_programs {
     fn cli_sleep() -> Result<()> {
         run_wasmtime(&["run", CLI_SLEEP])?;
         run_wasmtime(&["run", CLI_SLEEP_COMPONENT])?;
+        Ok(())
+    }
+
+    #[test]
+    fn cli_sleep_forever() -> Result<()> {
+        for timeout in [
+            // Tests still pass when we race with going to sleep.
+            "-Wtimeout=1ns",
+            // Tests pass when we wait till the Wasm has (likely) gone to sleep.
+            "-Wtimeout=250ms",
+        ] {
+            let e = run_wasmtime(&["run", timeout, CLI_SLEEP_FOREVER]).unwrap_err();
+            let e = e.to_string();
+            println!("Got error: {e}");
+            assert!(e.contains("interrupt"));
+
+            let e = run_wasmtime(&["run", timeout, CLI_SLEEP_FOREVER_COMPONENT]).unwrap_err();
+            let e = e.to_string();
+            println!("Got error: {e}");
+            assert!(e.contains("interrupt"));
+        }
+
         Ok(())
     }
 
@@ -1924,4 +1987,44 @@ fn settings_command() -> Result<()> {
     let output = run_wasmtime(&["settings"])?;
     assert!(output.contains("Cranelift settings for target"));
     Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn profile_with_vtune() -> Result<()> {
+    if !is_vtune_available() {
+        println!("> `vtune` is not available on the system path; skipping test");
+        return Ok(());
+    }
+
+    let mut bin = Command::new("vtune");
+    bin.args(&[
+        // Configure VTune...
+        "-verbose",
+        "-collect",
+        "hotspots",
+        "-user-data-dir",
+        &std::env::temp_dir().to_string_lossy(),
+        // ...then run Wasmtime with profiling enabled:
+        &get_wasmtime_path()?.to_string_lossy(),
+        "--profile=vtune",
+        "tests/all/cli_tests/simple.wat",
+    ]);
+
+    println!("> executing: {bin:?}");
+    let output = bin.output()?;
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    println!("> stdout:\n{stdout}");
+    assert!(stdout.contains("CPU Time"));
+    println!("> stderr:\n{stderr}");
+    assert!(!stderr.contains("Error"));
+    Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
+fn is_vtune_available() -> bool {
+    Command::new("vtune").arg("-version").output().is_ok()
 }

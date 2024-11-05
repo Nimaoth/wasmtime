@@ -70,24 +70,24 @@
 //! SP at function entry ----->  | return address            |
 //!                              +---------------------------+
 //! FP after prologue -------->  | FP (pushed by prologue)   |
-//!                              +---------------------------+   -----
-//!                              |          ...              |     |
-//!                              | clobbered callee-saves    |     |
-//! unwind-frame base -------->  | (pushed by prologue)      |     |
-//!                              +---------------------------+     |
-//!                              |          ...              |     |
-//!                              | spill slots               |     |
-//!                              | (accessed via SP)         |   active
-//!                              |          ...              |    size
-//!                              | stack slots               |     |
-//!                              | (accessed via SP)         |     |
-//!                              | (alloc'd by prologue)     |     |
-//!                              +---------------------------+     |
-//!                              | [alignment as needed]     |     |
-//!                              |          ...              |     |
-//!                              | args for largest call     |     |
-//! SP ----------------------->  | (alloc'd by prologue)     |     |
-//!                              +===========================+   -----
+//!                              +---------------------------+           -----
+//!                              |          ...              |             |
+//!                              | clobbered callee-saves    |             |
+//! unwind-frame base -------->  | (pushed by prologue)      |             |
+//!                              +---------------------------+   -----     |
+//!                              |          ...              |     |       |
+//!                              | spill slots               |     |       |
+//!                              | (accessed via SP)         |   fixed   active
+//!                              |          ...              |   frame    size
+//!                              | stack slots               |  storage    |
+//!                              | (accessed via SP)         |    size     |
+//!                              | (alloc'd by prologue)     |     |       |
+//!                              +---------------------------+   -----     |
+//!                              | [alignment as needed]     |             |
+//!                              |          ...              |             |
+//!                              | args for largest call     |             |
+//! SP ----------------------->  | (alloc'd by prologue)     |             |
+//!                              +===========================+           -----
 //!
 //!   (low address)
 //! ```
@@ -205,10 +205,6 @@ pub enum ABIArg {
     /// area; on the callee side, we compute a pointer to this stack area and
     /// provide that as the argument's value.
     StructArg {
-        /// Register or stack slot holding a pointer to the buffer as passed
-        /// by the caller to the callee.  If None, the ABI defines the buffer
-        /// to reside at a well-known location (i.e. at `offset` below).
-        pointer: Option<ABIArgSlot>,
         /// Offset of this arg relative to base of stack args.
         offset: i64,
         /// Size of this arg on the stack.
@@ -346,6 +342,11 @@ pub trait ABIMachineSpec {
 
     /// The ISA flags type.
     type F: IsaFlags;
+
+    /// This is the limit for the size of argument and return-value areas on the
+    /// stack. We place a reasonable limit here to avoid integer overflow issues
+    /// with 32-bit arithmetic.
+    const STACK_ARG_RET_SIZE_LIMIT: u32;
 
     /// Returns the number of bits in a word, that is 32/64 for 32/64-bit architecture.
     fn word_bits() -> u32;
@@ -541,16 +542,7 @@ pub trait ABIMachineSpec {
 
     /// Generate a call instruction/sequence. This method is provided one
     /// temporary register to use to synthesize the called address, if needed.
-    fn gen_call(
-        dest: &CallDest,
-        uses: CallArgList,
-        defs: CallRetList,
-        clobbers: PRegSet,
-        tmp: Writable<Reg>,
-        callee_conv: isa::CallConv,
-        caller_conv: isa::CallConv,
-        callee_pop_size: u32,
-    ) -> SmallVec<[Self::I; 2]>;
+    fn gen_call(dest: &CallDest, tmp: Writable<Reg>, info: CallInfo<()>) -> SmallVec<[Self::I; 2]>;
 
     /// Generate a memcpy invocation. Used to set up struct
     /// args. Takes `src`, `dst` as read-only inputs and passes a temporary
@@ -586,6 +578,56 @@ pub trait ABIMachineSpec {
         call_conv: isa::CallConv,
         specified: ir::ArgumentExtension,
     ) -> ir::ArgumentExtension;
+}
+
+/// Out-of-line data for calls, to keep the size of `Inst` down.
+#[derive(Clone, Debug)]
+pub struct CallInfo<T> {
+    /// Receiver of this call
+    pub dest: T,
+    /// Register uses of this call.
+    pub uses: CallArgList,
+    /// Register defs of this call.
+    pub defs: CallRetList,
+    /// Registers clobbered by this call, as per its calling convention.
+    pub clobbers: PRegSet,
+    /// The calling convention of the callee.
+    pub callee_conv: isa::CallConv,
+    /// The calling convention of the caller.
+    pub caller_conv: isa::CallConv,
+    /// The number of bytes that the callee will pop from the stack for the
+    /// caller, if any. (Used for popping stack arguments with the `tail`
+    /// calling convention.)
+    pub callee_pop_size: u32,
+}
+
+impl<T> CallInfo<T> {
+    /// Creates an empty set of info with no clobbers/uses/etc with the
+    /// specified ABI
+    pub fn empty(dest: T, call_conv: isa::CallConv) -> CallInfo<T> {
+        CallInfo {
+            dest,
+            uses: smallvec![],
+            defs: smallvec![],
+            clobbers: PRegSet::empty(),
+            caller_conv: call_conv,
+            callee_conv: call_conv,
+            callee_pop_size: 0,
+        }
+    }
+
+    /// Change the `T` payload on this info to `U`.
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> CallInfo<U> {
+        CallInfo {
+            dest: f(self.dest),
+            uses: self.uses,
+            defs: self.defs,
+            clobbers: self.clobbers,
+            caller_conv: self.caller_conv,
+            callee_conv: self.callee_conv,
+            callee_pop_size: self.callee_pop_size,
+        }
+    }
 }
 
 /// The id of an ABI signature within the `SigSet`.
@@ -772,11 +814,7 @@ impl SigSet {
 
     /// Get the already-interned ABI signature id for the given `ir::SigRef`.
     pub fn abi_sig_for_sig_ref(&self, sig_ref: ir::SigRef) -> Sig {
-        self.ir_sig_ref_to_abi_sig
-            .get(sig_ref)
-            // Should have a secondary map entry...
-            .expect("must call `make_abi_sig_from_ir_sig_ref` before `get_abi_sig_for_sig_ref`")
-            // ...and that entry should be initialized.
+        self.ir_sig_ref_to_abi_sig[sig_ref]
             .expect("must call `make_abi_sig_from_ir_sig_ref` before `get_abi_sig_for_sig_ref`")
     }
 
@@ -793,12 +831,21 @@ impl SigSet {
         sig: &ir::Signature,
         flags: &settings::Flags,
     ) -> CodegenResult<SigData> {
-        use std::borrow::Cow;
-
-        let returns = if let Some(sret) = missing_struct_return(sig) {
-            Cow::from_iter(std::iter::once(&sret).chain(&sig.returns).copied())
+        // Keep in sync with ensure_struct_return_ptr_is_returned
+        if sig.uses_special_return(ArgumentPurpose::StructReturn) {
+            panic!("Explicit StructReturn return value not allowed: {sig:?}")
+        }
+        let tmp;
+        let returns = if let Some(struct_ret_index) =
+            sig.special_param_index(ArgumentPurpose::StructReturn)
+        {
+            if !sig.returns.is_empty() {
+                panic!("No return values are allowed when using StructReturn: {sig:?}");
+            }
+            tmp = [sig.params[struct_ret_index]];
+            &tmp
         } else {
-            Cow::from(sig.returns.as_slice())
+            sig.returns.as_slice()
         };
 
         // Compute args and retvals from signature. Handle retvals first,
@@ -817,7 +864,16 @@ impl SigSet {
         )?;
         let rets_end = u32::try_from(self.abi_args.len()).unwrap();
 
+        // To avoid overflow issues, limit the return size to something reasonable.
+        if sized_stack_ret_space > M::STACK_ARG_RET_SIZE_LIMIT {
+            return Err(CodegenError::ImplLimitExceeded);
+        }
+
         let need_stack_return_area = sized_stack_ret_space > 0;
+        if need_stack_return_area {
+            assert!(!sig.uses_special_param(ir::ArgumentPurpose::StructReturn));
+        }
+
         let (sized_stack_arg_space, stack_ret_arg) = M::compute_arg_locs(
             sig.call_conv,
             flags,
@@ -827,6 +883,11 @@ impl SigSet {
             ArgsAccumulator::new(&mut self.abi_args),
         )?;
         let args_end = u32::try_from(self.abi_args.len()).unwrap();
+
+        // To avoid overflow issues, limit the arg size to something reasonable.
+        if sized_stack_arg_space > M::STACK_ARG_RET_SIZE_LIMIT {
+            return Err(CodegenError::ImplLimitExceeded);
+        }
 
         trace!(
             "ABISig: sig {:?} => args end = {} rets end = {}
@@ -986,6 +1047,11 @@ impl FrameLayout {
     pub fn active_size(&self) -> u32 {
         self.outgoing_args_size + self.fixed_frame_storage_size + self.clobber_size
     }
+
+    /// Get the offset from the SP to the sized stack slots area.
+    pub fn sp_to_sized_stack_slots(&self) -> u32 {
+        self.outgoing_args_size
+    }
 }
 
 /// ABI object for a function body.
@@ -1079,57 +1145,72 @@ impl<M: ABIMachineSpec> Callee<M> {
                 || call_conv == isa::CallConv::Tail
                 || call_conv == isa::CallConv::Fast
                 || call_conv == isa::CallConv::Cold
-                || call_conv.extends_windows_fastcall()
-                || call_conv == isa::CallConv::WasmtimeSystemV
+                || call_conv == isa::CallConv::WindowsFastcall
                 || call_conv == isa::CallConv::AppleAarch64
                 || call_conv == isa::CallConv::Winch,
-            "Unsupported calling convention: {:?}",
-            call_conv
+            "Unsupported calling convention: {call_conv:?}"
         );
 
         // Compute sized stackslot locations and total stackslot size.
-        let mut sized_stack_offset: u32 = 0;
+        let mut end_offset: u32 = 0;
         let mut sized_stackslots = PrimaryMap::new();
+
         for (stackslot, data) in f.sized_stack_slots.iter() {
-            let off = sized_stack_offset;
-            sized_stack_offset = sized_stack_offset
-                .checked_add(data.size)
-                .ok_or(CodegenError::ImplLimitExceeded)?;
-            // Always at least machine-word-align slots, but also
+            // We start our computation possibly unaligned where the previous
+            // stackslot left off.
+            let unaligned_start_offset = end_offset;
+
+            // The start of the stackslot must be aligned.
+            //
+            // We always at least machine-word-align slots, but also
             // satisfy the user's requested alignment.
             debug_assert!(data.align_shift < 32);
             let align = std::cmp::max(M::word_bytes(), 1u32 << data.align_shift);
             let mask = align - 1;
-            sized_stack_offset = checked_round_up(sized_stack_offset, mask)
+            let start_offset = checked_round_up(unaligned_start_offset, mask)
                 .ok_or(CodegenError::ImplLimitExceeded)?;
+
+            // The end offset is the the start offset increased by the size
+            end_offset = start_offset
+                .checked_add(data.size)
+                .ok_or(CodegenError::ImplLimitExceeded)?;
+
             debug_assert_eq!(stackslot.as_u32() as usize, sized_stackslots.len());
-            sized_stackslots.push(off);
+            sized_stackslots.push(start_offset);
         }
 
         // Compute dynamic stackslot locations and total stackslot size.
         let mut dynamic_stackslots = PrimaryMap::new();
-        let mut dynamic_stack_offset: u32 = sized_stack_offset;
         for (stackslot, data) in f.dynamic_stack_slots.iter() {
             debug_assert_eq!(stackslot.as_u32() as usize, dynamic_stackslots.len());
-            let off = dynamic_stack_offset;
+
+            // This computation is similar to the stackslots above
+            let unaligned_start_offset = end_offset;
+
+            let mask = M::word_bytes() - 1;
+            let start_offset = checked_round_up(unaligned_start_offset, mask)
+                .ok_or(CodegenError::ImplLimitExceeded)?;
+
             let ty = f.get_concrete_dynamic_ty(data.dyn_ty).ok_or_else(|| {
                 CodegenError::Unsupported(format!("invalid dynamic vector type: {}", data.dyn_ty))
             })?;
-            dynamic_stack_offset = dynamic_stack_offset
+
+            end_offset = start_offset
                 .checked_add(isa.dynamic_vector_bytes(ty))
                 .ok_or(CodegenError::ImplLimitExceeded)?;
-            let mask = M::word_bytes() - 1;
-            dynamic_stack_offset = checked_round_up(dynamic_stack_offset, mask)
-                .ok_or(CodegenError::ImplLimitExceeded)?;
-            dynamic_stackslots.push(off);
+
+            dynamic_stackslots.push(start_offset);
         }
-        let stackslots_size = dynamic_stack_offset;
+
+        // The size of the stackslots needs to be word aligned
+        let stackslots_size = checked_round_up(end_offset, M::word_bytes() - 1)
+            .ok_or(CodegenError::ImplLimitExceeded)?;
 
         let mut dynamic_type_sizes = HashMap::with_capacity(f.dfg.dynamic_types.len());
         for (dyn_ty, _data) in f.dfg.dynamic_types.iter() {
             let ty = f
                 .get_concrete_dynamic_ty(dyn_ty)
-                .unwrap_or_else(|| panic!("invalid dynamic vector type: {}", dyn_ty));
+                .unwrap_or_else(|| panic!("invalid dynamic vector type: {dyn_ty}"));
             let size = isa.dynamic_vector_bytes(ty);
             dynamic_type_sizes.insert(ty, size);
         }
@@ -1284,25 +1365,27 @@ fn generate_gv<M: ABIMachineSpec>(
             ));
             return into_reg.to_reg();
         }
-        ref other => panic!("global value for stack limit not supported: {}", other),
+        ref other => panic!("global value for stack limit not supported: {other}"),
     }
 }
 
-/// If the signature needs to be legalized, then return the struct-return
-/// parameter that should be prepended to its returns. Otherwise, return `None`.
-fn missing_struct_return(sig: &ir::Signature) -> Option<ir::AbiParam> {
-    let struct_ret_index = sig.special_param_index(ArgumentPurpose::StructReturn)?;
-    if !sig.uses_special_return(ArgumentPurpose::StructReturn) {
-        return Some(sig.params[struct_ret_index]);
-    }
-
-    None
+/// Returns true if the signature needs to be legalized.
+fn missing_struct_return(sig: &ir::Signature) -> bool {
+    sig.uses_special_param(ArgumentPurpose::StructReturn)
+        && !sig.uses_special_return(ArgumentPurpose::StructReturn)
 }
 
 fn ensure_struct_return_ptr_is_returned(sig: &ir::Signature) -> ir::Signature {
+    // Keep in sync with Callee::new
     let mut sig = sig.clone();
-    if let Some(sret) = missing_struct_return(&sig) {
-        sig.returns.insert(0, sret);
+    if sig.uses_special_return(ArgumentPurpose::StructReturn) {
+        panic!("Explicit StructReturn return value not allowed: {sig:?}")
+    }
+    if let Some(struct_ret_index) = sig.special_param_index(ArgumentPurpose::StructReturn) {
+        if !sig.returns.is_empty() {
+            panic!("No return values are allowed when using StructReturn: {sig:?}");
+        }
+        sig.returns.insert(0, sig.params[struct_ret_index]);
     }
     sig
 }
@@ -1314,7 +1397,7 @@ impl<M: ABIMachineSpec> Callee<M> {
     /// Access the (possibly legalized) signature.
     pub fn signature(&self) -> &ir::Signature {
         debug_assert!(
-            missing_struct_return(&self.ir_sig).is_none(),
+            !missing_struct_return(&self.ir_sig),
             "`Callee::ir_sig` is always legalized"
         );
         &self.ir_sig
@@ -1439,20 +1522,13 @@ impl<M: ABIMachineSpec> Callee<M> {
                     copy_arg_slot_to_reg(&slot, &into_reg);
                 }
             }
-            &ABIArg::StructArg {
-                pointer, offset, ..
-            } => {
+            &ABIArg::StructArg { offset, .. } => {
                 let into_reg = into_regs.only_reg().unwrap();
-                if let Some(slot) = pointer {
-                    // Buffer address is passed in a register or stack slot.
-                    copy_arg_slot_to_reg(&slot, &into_reg);
-                } else {
-                    // Buffer address is implicitly defined by the ABI.
-                    insts.push(M::gen_get_stack_addr(
-                        StackAMode::IncomingArg(offset, sigs[self.sig].sized_stack_arg_space),
-                        into_reg,
-                    ));
-                }
+                // Buffer address is implicitly defined by the ABI.
+                insts.push(M::gen_get_stack_addr(
+                    StackAMode::IncomingArg(offset, sigs[self.sig].sized_stack_arg_space),
+                    into_reg,
+                ));
             }
             &ABIArg::ImplicitPtrArg { pointer, ty, .. } => {
                 let into_reg = into_regs.only_reg().unwrap();
@@ -1660,38 +1736,6 @@ impl<M: ABIMachineSpec> Callee<M> {
 /// These methods of `Callee` may only be called after
 /// regalloc.
 impl<M: ABIMachineSpec> Callee<M> {
-    /// Generate a stack map, given a list of spillslots and the emission state
-    /// at a given program point (prior to emission of the safepointing
-    /// instruction).
-    pub fn spillslots_to_stack_map(
-        &self,
-        slots: &[SpillSlot],
-        state: &<M::I as MachInstEmit>::State,
-    ) -> StackMap {
-        let frame_layout = state.frame_layout();
-        let outgoing_args_size = frame_layout.outgoing_args_size;
-        let clobbers_and_slots = frame_layout.fixed_frame_storage_size + frame_layout.clobber_size;
-        trace!(
-            "spillslots_to_stackmap: slots = {:?}, state = {:?}",
-            slots,
-            state
-        );
-        let map_size = outgoing_args_size + clobbers_and_slots;
-        let bytes = M::word_bytes();
-        let map_words = (map_size + bytes - 1) / bytes;
-        let mut bits = std::iter::repeat(false)
-            .take(map_words as usize)
-            .collect::<Vec<bool>>();
-
-        let first_spillslot_word = ((self.stackslots_size + outgoing_args_size) / bytes) as usize;
-        for &slot in slots {
-            let slot = slot.index();
-            bits[first_spillslot_word + slot] = true;
-        }
-
-        StackMap::from_slice(&bits[..])
-    }
-
     /// Compute the final frame layout, post-regalloc.
     ///
     /// This must be called before gen_prologue or gen_epilogue.
@@ -2124,37 +2168,27 @@ impl<M: ABIMachineSpec> CallSite<M> {
                             reg, ty, extension, ..
                         } => {
                             let ext = M::get_ext_mode(ctx.sigs()[self.sig].call_conv, extension);
-                            let vreg = if ext != ir::ArgumentExtension::None
-                                && ty_bits(ty) < word_bits
-                            {
-                                assert_eq!(word_rc, reg.class());
-                                let signed = match ext {
-                                    ir::ArgumentExtension::Uext => false,
-                                    ir::ArgumentExtension::Sext => true,
-                                    _ => unreachable!(),
+                            let vreg =
+                                if ext != ir::ArgumentExtension::None && ty_bits(ty) < word_bits {
+                                    assert_eq!(word_rc, reg.class());
+                                    let signed = match ext {
+                                        ir::ArgumentExtension::Uext => false,
+                                        ir::ArgumentExtension::Sext => true,
+                                        _ => unreachable!(),
+                                    };
+                                    let extend_result =
+                                        ctx.alloc_tmp(M::word_type()).only_reg().unwrap();
+                                    ctx.emit(M::gen_extend(
+                                        extend_result,
+                                        *from_reg,
+                                        signed,
+                                        ty_bits(ty) as u8,
+                                        word_bits as u8,
+                                    ));
+                                    extend_result.to_reg()
+                                } else {
+                                    *from_reg
                                 };
-                                let extend_result =
-                                    ctx.alloc_tmp(M::word_type()).only_reg().unwrap();
-                                ctx.emit(M::gen_extend(
-                                    extend_result,
-                                    *from_reg,
-                                    signed,
-                                    ty_bits(ty) as u8,
-                                    word_bits as u8,
-                                ));
-                                extend_result.to_reg()
-                            } else if ty.is_ref() {
-                                // Reference-typed args need to be
-                                // passed as a copy; the original vreg
-                                // is constrained to the stack and
-                                // this copy is in a reg.
-                                let ref_copy = ctx.alloc_tmp(M::word_type()).only_reg().unwrap();
-                                ctx.emit(M::gen_move(ref_copy, *from_reg, M::word_type()));
-
-                                ref_copy.to_reg()
-                            } else {
-                                *from_reg
-                            };
 
                             let preg = reg.into();
                             self.uses.push(CallArgPair { vreg, preg });
@@ -2197,8 +2231,8 @@ impl<M: ABIMachineSpec> CallSite<M> {
                     }
                 }
             }
-            ABIArg::StructArg { pointer, .. } => {
-                assert!(pointer.is_none()); // Only supported via ISLE.
+            ABIArg::StructArg { .. } => {
+                // Only supported via ISLE.
             }
             ABIArg::ImplicitPtrArg {
                 offset,
@@ -2310,7 +2344,7 @@ impl<M: ABIMachineSpec> CallSite<M> {
         let value_regs = match *into_regs {
             [a] => ValueRegs::one(a),
             [a, b] => ValueRegs::two(a, b),
-            _ => panic!("Expected to see one or two slots only from {:?}", ret),
+            _ => panic!("Expected to see one or two slots only from {ret:?}"),
         };
         (insts, value_regs)
     }
@@ -2383,13 +2417,16 @@ impl<M: ABIMachineSpec> CallSite<M> {
         // references to SP offsets.)
         for inst in M::gen_call(
             &self.dest,
-            uses,
-            defs,
-            clobbers,
             tmp,
-            call_conv,
-            self.caller_conv,
-            callee_pop_size,
+            CallInfo {
+                dest: (),
+                uses,
+                defs,
+                clobbers,
+                callee_conv: call_conv,
+                caller_conv: self.caller_conv,
+                callee_pop_size,
+            },
         )
         .into_iter()
         {

@@ -354,6 +354,7 @@ macro_rules! for_each_function_signature {
         $mac!(14 A1 A2 A3 A4 A5 A6 A7 A8 A9 A10 A11 A12 A13 A14);
         $mac!(15 A1 A2 A3 A4 A5 A6 A7 A8 A9 A10 A11 A12 A13 A14 A15);
         $mac!(16 A1 A2 A3 A4 A5 A6 A7 A8 A9 A10 A11 A12 A13 A14 A15 A16);
+        $mac!(17 A1 A2 A3 A4 A5 A6 A7 A8 A9 A10 A11 A12 A13 A14 A15 A16 A17);
     };
 }
 
@@ -600,14 +601,23 @@ impl Func {
     /// | `Func`                            | `(ref func)`                              |
     /// | `Option<Nofunc>`                  | `nullfuncref` aka `(ref null nofunc)`     |
     /// | `NoFunc`                          | `(ref nofunc)`                            |
-    /// | `Option<ExternRef>`               | `externref` aka `(ref null extern)`       |
-    /// | `ExternRef`                       | `(ref extern)`                            |
+    /// | `Option<Rooted<ExternRef>>`       | `externref` aka `(ref null extern)`       |
+    /// | `Rooted<ExternRef>`               | `(ref extern)`                            |
     /// | `Option<NoExtern>`                | `nullexternref` aka `(ref null noextern)` |
     /// | `NoExtern`                        | `(ref noextern)`                          |
-    /// | `Option<AnyRef>`                  | `anyref` aka `(ref null any)`             |
-    /// | `AnyRef`                          | `(ref any)`                               |
+    /// | `Option<Rooted<AnyRef>>`          | `anyref` aka `(ref null any)`             |
+    /// | `Rooted<AnyRef>`                  | `(ref any)`                               |
+    /// | `Option<Rooted<EqRef>>`           | `eqref` aka `(ref null eq)`               |
+    /// | `Rooted<EqRef>`                   | `(ref eq)`                                |
     /// | `Option<I31>`                     | `i31ref` aka `(ref null i31)`             |
     /// | `I31`                             | `(ref i31)`                               |
+    /// | `Option<Rooted<StructRef>>`       | `(ref null struct)`                       |
+    /// | `Rooted<StructRef>`               | `(ref struct)`                            |
+    /// | `Option<Rooted<ArrayRef>>`        | `(ref null array)`                        |
+    /// | `Rooted<ArrayRef>`                | `(ref array)`                             |
+    ///
+    /// Note that anywhere a `Rooted<T>` appears, a `ManuallyRooted<T>` may also
+    /// be used.
     ///
     /// Any of the Rust types can be returned from the closure as well, in
     /// addition to some extra types
@@ -984,8 +994,8 @@ impl Func {
     /// # Panics
     ///
     /// This function will panic if called on a function belonging to an async
-    /// store. Asynchronous stores must always use `call_async`.
-    /// initiates a panic. Also panics if `store` does not own this function.
+    /// store. Asynchronous stores must always use `call_async`. Also panics if
+    /// `store` does not own this function.
     ///
     /// [`WasmBacktrace`]: crate::WasmBacktrace
     pub fn call(
@@ -1420,14 +1430,20 @@ impl Func {
     /// | `i64`                                     | `i64` or `u64`                        |
     /// | `f32`                                     | `f32`                                 |
     /// | `f64`                                     | `f64`                                 |
-    /// | `externref` aka `(ref null extern)`       | `Option<ExternRef>`                   |
-    /// | `(ref extern)`                            | `ExternRef`                           |
-    /// | `(ref noextern)`                          | `NoExtern`                            |
+    /// | `externref` aka `(ref null extern)`       | `Option<Rooted<ExternRef>>`           |
+    /// | `(ref extern)`                            | `Rooted<ExternRef>`                   |
     /// | `nullexternref` aka `(ref null noextern)` | `Option<NoExtern>`                    |
-    /// | `anyref` aka `(ref null any)`             | `Option<AnyRef>`                      |
-    /// | `(ref any)`                               | `AnyRef`                              |
+    /// | `(ref noextern)`                          | `NoExtern`                            |
+    /// | `anyref` aka `(ref null any)`             | `Option<Rooted<AnyRef>>`              |
+    /// | `(ref any)`                               | `Rooted<AnyRef>`                      |
+    /// | `eqref` aka `(ref null eq)`               | `Option<Rooted<EqRef>>`               |
+    /// | `(ref eq)`                                | `Rooted<EqRef>`                       |
     /// | `i31ref` aka `(ref null i31)`             | `Option<I31>`                         |
     /// | `(ref i31)`                               | `I31`                                 |
+    /// | `structref` aka `(ref null struct)`       | `Option<Rooted<StructRef>>`           |
+    /// | `(ref struct)`                            | `Rooted<StructRef>`                   |
+    /// | `arrayref` aka `(ref null array)`         | `Option<Rooted<ArrayRef>>`            |
+    /// | `(ref array)`                             | `Rooted<ArrayRef>`                    |
     /// | `funcref` aka `(ref null func)`           | `Option<Func>`                        |
     /// | `(ref func)`                              | `Func`                                |
     /// | `(ref null <func type index>)`            | `Option<Func>`                        |
@@ -1436,7 +1452,8 @@ impl Func {
     /// | `(ref nofunc)`                            | `NoFunc`                              |
     /// | `v128`                                    | `V128` on `x86-64` and `aarch64` only |
     ///
-    /// (Note that this mapping is the same as that of [`Func::wrap`]).
+    /// (Note that this mapping is the same as that of [`Func::wrap`], and that
+    /// anywhere a `Rooted<T>` appears, a `ManuallyRooted<T>` may also appear).
     ///
     /// Note that once the [`TypedFunc`] return value is acquired you'll use either
     /// [`TypedFunc::call`] or [`TypedFunc::call_async`] as necessary to actually invoke
@@ -1593,6 +1610,7 @@ pub(crate) fn invoke_wasm_and_catch_traps<T>(
             store.0.signal_handler(),
             store.0.engine().config().wasm_backtrace,
             store.0.engine().config().coredump_on_trap,
+            store.0.async_guard_range(),
             store.0.default_caller(),
             closure,
         );

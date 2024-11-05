@@ -1607,6 +1607,26 @@ fn test_x64_emit() {
         "4983D700",
         "adcq    %r15, $0, %r15",
     ));
+    insns.push((
+        Inst::alu_rmi_r(
+            OperandSize::Size64,
+            AluRmiROpcode::Adc,
+            RegMemImm::mem(Amode::imm_reg(99, rdi)),
+            w_r15,
+        ),
+        "4C137F63",
+        "adcq    %r15, 99(%rdi), %r15",
+    ));
+    insns.push((
+        Inst::alu_rmi_r(
+            OperandSize::Size64,
+            AluRmiROpcode::Sbb,
+            RegMemImm::mem(Amode::imm_reg(99, rdi)),
+            w_r15,
+        ),
+        "4C1B7F63",
+        "sbbq    %r15, 99(%rdi), %r15",
+    ));
 
     // ========================================================
     // AluRM
@@ -1880,7 +1900,7 @@ fn test_x64_emit() {
         Inst::div(
             OperandSize::Size32,
             DivSignedness::Signed,
-            TrapCode::IntegerDivisionByZero,
+            TrapCode::INTEGER_DIVISION_BY_ZERO,
             RegMem::reg(regs::rsi()),
             Gpr::unwrap_new(regs::rax()),
             Gpr::unwrap_new(regs::rdx()),
@@ -1894,7 +1914,7 @@ fn test_x64_emit() {
         Inst::div(
             OperandSize::Size64,
             DivSignedness::Signed,
-            TrapCode::IntegerDivisionByZero,
+            TrapCode::INTEGER_DIVISION_BY_ZERO,
             RegMem::reg(regs::r15()),
             Gpr::unwrap_new(regs::rax()),
             Gpr::unwrap_new(regs::rdx()),
@@ -1908,7 +1928,7 @@ fn test_x64_emit() {
         Inst::div(
             OperandSize::Size32,
             DivSignedness::Unsigned,
-            TrapCode::IntegerDivisionByZero,
+            TrapCode::INTEGER_DIVISION_BY_ZERO,
             RegMem::reg(regs::r14()),
             Gpr::unwrap_new(regs::rax()),
             Gpr::unwrap_new(regs::rdx()),
@@ -1922,7 +1942,7 @@ fn test_x64_emit() {
         Inst::div(
             OperandSize::Size64,
             DivSignedness::Unsigned,
-            TrapCode::IntegerDivisionByZero,
+            TrapCode::INTEGER_DIVISION_BY_ZERO,
             RegMem::reg(regs::rdi()),
             Gpr::unwrap_new(regs::rax()),
             Gpr::unwrap_new(regs::rdx()),
@@ -1935,7 +1955,7 @@ fn test_x64_emit() {
     insns.push((
         Inst::div8(
             DivSignedness::Unsigned,
-            TrapCode::IntegerDivisionByZero,
+            TrapCode::INTEGER_DIVISION_BY_ZERO,
             RegMem::reg(regs::rax()),
             Gpr::unwrap_new(regs::rax()),
             WritableGpr::from_reg(Gpr::unwrap_new(regs::rax())),
@@ -1946,7 +1966,7 @@ fn test_x64_emit() {
     insns.push((
         Inst::div8(
             DivSignedness::Unsigned,
-            TrapCode::IntegerDivisionByZero,
+            TrapCode::INTEGER_DIVISION_BY_ZERO,
             RegMem::reg(regs::rsi()),
             Gpr::unwrap_new(regs::rax()),
             WritableGpr::from_reg(Gpr::unwrap_new(regs::rax())),
@@ -3727,14 +3747,10 @@ fn test_x64_emit() {
     // ========================================================
     // CallKnown
     insns.push((
-        Inst::call_known(
+        Inst::call_known(Box::new(CallInfo::empty(
             ExternalName::User(UserExternalNameRef::new(0)),
-            smallvec![],
-            smallvec![],
-            PRegSet::default(),
-            0,
             CallConv::SystemV,
-        ),
+        ))),
         "E800000000",
         "call    User(userextname0)",
     ));
@@ -3742,14 +3758,7 @@ fn test_x64_emit() {
     // ========================================================
     // CallUnknown
     fn call_unknown(rm: RegMem) -> Inst {
-        Inst::call_unknown(
-            rm,
-            smallvec![],
-            smallvec![],
-            PRegSet::default(),
-            0,
-            CallConv::SystemV,
-        )
+        Inst::call_unknown(Box::new(CallInfo::empty(rm, CallConv::SystemV)))
     }
 
     insns.push((call_unknown(RegMem::reg(rbp)), "FFD5", "call    *%rbp"));
@@ -5065,8 +5074,8 @@ fn test_x64_emit() {
 
     insns.push((Inst::Hlt, "CC", "hlt"));
 
-    let trap_code = TrapCode::UnreachableCodeReached;
-    insns.push((Inst::Ud2 { trap_code }, "0F0B", "ud2 unreachable"));
+    let trap_code = TrapCode::INTEGER_OVERFLOW;
+    insns.push((Inst::Ud2 { trap_code }, "0F0B", "ud2 int_ovf"));
 
     insns.push((
         Inst::ElfTlsGetAddr {
@@ -5132,6 +5141,6 @@ fn test_x64_emit() {
 
         let buffer = buffer.finish(&constants, ctrl_plane);
         let actual_encoding = &buffer.stringify_code_bytes();
-        assert_eq!(expected_encoding, actual_encoding, "{}", expected_printing);
+        assert_eq!(expected_encoding, actual_encoding, "{expected_printing}");
     }
 }

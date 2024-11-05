@@ -34,12 +34,6 @@
       (vec_imm ty (be_vec_const ty x)))
 
 
-;;;; Rules for `null` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-(rule (lower (has_type ty (null)))
-      (imm ty 0))
-
-
 ;;;; Rules for `nop` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (rule (lower (nop))
@@ -415,6 +409,15 @@
             (res_hi Reg (add_reg $I64 res_hi_3 (add_reg $I64 res_hi_2 res_hi_1))))
         (mov_to_vec128 $I64X2 res_hi res_lo)))
 
+;; Special-case the lowering of a 128-bit multiply where the operands are sign
+;; or zero extended. This maps directly to `umul_wide` and `smul_wide`.
+(rule 16 (lower (has_type $I128 (imul (uextend x) (uextend y))))
+  (let ((pair RegPair (umul_wide (put_in_reg_zext64 x) (put_in_reg_zext64 y))))
+    (mov_to_vec128 $I64X2 (regpair_hi pair) (regpair_lo pair))))
+
+(rule 16 (lower (has_type $I128 (imul (sextend x) (sextend y))))
+  (let ((pair RegPair (smul_wide (put_in_reg_sext64 x) (put_in_reg_sext64 y))))
+    (mov_to_vec128 $I64X2 (regpair_hi pair) (regpair_lo pair))))
 
 ;;;; Rules for `umulhi` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -611,7 +614,7 @@
 ;; would indeed happen, we have no way of signalling two different trap
 ;; conditions from the same instruction.  By explicitly checking for the
 ;; integer-overflow case ahead of time, any hardware trap in the divide
-;; instruction is guaranteed to indicate divison-by-zero.
+;; instruction is guaranteed to indicate division-by-zero.
 ;;
 ;; In addition, for types smaller than 64 bits we would have to perform
 ;; the check explicitly anyway, since the instruction provides a 64-bit
@@ -1726,18 +1729,6 @@
 (rule (lower (has_type $I32 (bitcast _ x @ (value_type $F32))))
       (vec_extract_lane $F32X4 x 0 (zero_reg)))
 
-;; Bitcasts between `r{32,64}` and `i{32,64}` need to be a copy to avoid
-;; conflicting regalloc constraints on reference type values that both need to
-;; be in some register but also some safepoint stack slot at the same time.
-(rule 6 (lower (has_type $R32 (bitcast _ x @ (value_type $I32))))
-      (copy_reg $I32 x))
-(rule 6 (lower (has_type $R64 (bitcast _ x @ (value_type $I64))))
-      (copy_reg $I64 x))
-(rule 6 (lower (has_type $I32 (bitcast _ x @ (value_type $R32))))
-      (copy_reg $I32 x))
-(rule 6 (lower (has_type $I64 (bitcast _ x @ (value_type $R64))))
-      (copy_reg $I64 x))
-
 ;; Bitcast between types residing in GPRs is a no-op.
 (rule 1 (lower (has_type (gpr32_ty _)
                          (bitcast _ x @ (value_type (gpr32_ty _)))))
@@ -2287,9 +2278,12 @@
 (decl lib_call_tls_get_offset (Reg Reg SymbolReloc) Reg)
 (rule (lib_call_tls_get_offset got got_offset symbol)
       (let ((tls_offset WritableReg (temp_writable_reg $I64))
-            (libcall LibCallInfo (lib_call_info_tls_get_offset tls_offset got got_offset symbol))
-            (_ InstOutput (side_effect (lib_call libcall))))
+            (_ Unit (abi_for_elf_tls_get_offset))
+            (_ Unit (emit (MInst.ElfTlsGetOffset tls_offset got got_offset (writable_link_reg) symbol))))
         tls_offset))
+
+(decl abi_for_elf_tls_get_offset () Unit)
+(extern constructor abi_for_elf_tls_get_offset abi_for_elf_tls_get_offset)
 
 ;; Helper to extract the current thread pointer from %a0/%a1.
 (decl thread_pointer () Reg)
@@ -2325,14 +2319,6 @@
 
 ;; Load 64-bit little-endian integers.
 (rule -1 (lower (has_type $I64 (load flags @ (littleendian) addr offset)))
-      (loadrev64 (lower_address flags addr offset)))
-
-;; Load 64-bit big-endian references.
-(rule (lower (has_type $R64 (load flags @ (bigendian) addr offset)))
-      (load64 (lower_address flags addr offset)))
-
-;; Load 64-bit little-endian references.
-(rule -1 (lower (has_type $R64 (load flags @ (littleendian) addr offset)))
       (loadrev64 (lower_address flags addr offset)))
 
 ;; Load 32-bit big-endian floating-point values (as vector lane).
@@ -2651,10 +2637,6 @@
 
 ;; Store 64-bit integer type, main lowering entry point.
 (rule (lower (store flags val @ (value_type $I64) addr offset))
-      (side_effect (istore64_impl flags val addr offset)))
-
-;; Store 64-bit reference type, main lowering entry point.
-(rule (lower (store flags val @ (value_type $R64) addr offset))
       (side_effect (istore64_impl flags val addr offset)))
 
 ;; Store 32-bit big-endian floating-point type (as vector lane).
@@ -3687,20 +3669,6 @@
       (let ((mask Reg (vec_imm $I8X16 (imm8x16 128 128 128 128 128 128 128 128
                                                128 128 128 128 128 128 64 0))))
         (vec_extract_lane $I64X2 (vec_bitpermute x mask) 0 (zero_reg))))
-
-
-;;;; Rules for `is_null` and `is_invalid`  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-;; Null references are represented by the constant value 0.
-(rule (lower (has_type $I8 (is_null x @ (value_type $R64))))
-      (lower_bool $I8 (bool (icmps_simm16 $I64 x 0)
-                            (intcc_as_cond (IntCC.Equal)))))
-
-
-;; Invalid references are represented by the constant value -1.
-(rule (lower (has_type $I8 (is_invalid x @ (value_type $R64))))
-      (lower_bool $I8 (bool (icmps_simm16 $I64 x -1)
-                            (intcc_as_cond (IntCC.Equal)))))
 
 
 ;;;; Rules for `select` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;

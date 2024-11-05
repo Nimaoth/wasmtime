@@ -24,6 +24,16 @@ macro_rules! isle_common_prelude_methods {
         }
 
         #[inline]
+        fn u16_as_i16(&mut self, x: u16) -> i16 {
+            x as i16
+        }
+
+        #[inline]
+        fn u16_as_u32(&mut self, x: u16) -> u32 {
+            x.into()
+        }
+
+        #[inline]
         fn u16_as_u64(&mut self, x: u16) -> u64 {
             x.into()
         }
@@ -41,6 +51,11 @@ macro_rules! isle_common_prelude_methods {
         #[inline]
         fn u64_as_i32(&mut self, x: u64) -> i32 {
             x as i32
+        }
+
+        #[inline]
+        fn u64_as_i64(&mut self, x: u64) -> i64 {
+            x as i64
         }
 
         #[inline]
@@ -406,7 +421,7 @@ macro_rules! isle_common_prelude_methods {
         #[inline]
         fn ty_int_ref_64(&mut self, ty: Type) -> Option<Type> {
             match ty {
-                I64 | R64 => Some(ty),
+                I64 => Some(ty),
                 _ => None,
             }
         }
@@ -414,7 +429,7 @@ macro_rules! isle_common_prelude_methods {
         #[inline]
         fn ty_int_ref_16_to_64(&mut self, ty: Type) -> Option<Type> {
             match ty {
-                I16 | I32 | I64 | R64 => Some(ty),
+                I16 | I32 | I64 => Some(ty),
                 _ => None,
             }
         }
@@ -534,7 +549,7 @@ macro_rules! isle_common_prelude_methods {
         #[inline]
         fn ty_addr64(&mut self, ty: Type) -> Option<Type> {
             match ty {
-                I64 | R64 => Some(ty),
+                I64 => Some(ty),
                 _ => None,
             }
         }
@@ -633,15 +648,15 @@ macro_rules! isle_common_prelude_methods {
         }
 
         fn trap_code_division_by_zero(&mut self) -> TrapCode {
-            TrapCode::IntegerDivisionByZero
+            TrapCode::INTEGER_DIVISION_BY_ZERO
         }
 
         fn trap_code_integer_overflow(&mut self) -> TrapCode {
-            TrapCode::IntegerOverflow
+            TrapCode::INTEGER_OVERFLOW
         }
 
         fn trap_code_bad_conversion_to_integer(&mut self) -> TrapCode {
-            TrapCode::BadConversionToInteger
+            TrapCode::BAD_CONVERSION_TO_INTEGER
         }
 
         fn nonzero_u64_from_imm64(&mut self, val: Imm64) -> Option<u64> {
@@ -900,8 +915,40 @@ macro_rules! isle_common_prelude_methods {
             u32::try_from(val).ok()
         }
 
+        fn u32_as_u16(&mut self, val: u32) -> Option<u16> {
+            val.try_into().ok()
+        }
+
         fn u8_as_i8(&mut self, val: u8) -> i8 {
             val as i8
+        }
+
+        fn u64_as_u8(&mut self, val: u64) -> u8 {
+            val as u8
+        }
+
+        fn u64_as_u16(&mut self, val: u64) -> u16 {
+            val as u16
+        }
+
+        fn u16_try_from_u64(&mut self, val: u64) -> Option<u16> {
+            u16::try_from(val).ok()
+        }
+
+        fn u32_try_from_u64(&mut self, val: u64) -> Option<u32> {
+            u32::try_from(val).ok()
+        }
+
+        fn i8_try_from_u64(&mut self, val: u64) -> Option<i8> {
+            i8::try_from(val).ok()
+        }
+
+        fn i16_try_from_u64(&mut self, val: u64) -> Option<i16> {
+            i16::try_from(val).ok()
+        }
+
+        fn i32_try_from_u64(&mut self, val: u64) -> Option<i32> {
+            i32::try_from(val).ok()
         }
 
         fn u128_replicated_u64(&mut self, val: u128) -> Option<u64> {

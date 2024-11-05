@@ -294,6 +294,8 @@ pub(crate) mod prelude {
     pub use wasmtime_environ::prelude::*;
 }
 
+pub(crate) use hashbrown::{hash_map, hash_set};
+
 /// A helper macro to safely map `MaybeUninit<T>` to `MaybeUninit<U>` where `U`
 /// is a field projection within `T`.
 ///
@@ -363,7 +365,7 @@ pub use runtime::*;
 #[cfg(any(feature = "cranelift", feature = "winch"))]
 mod compile;
 #[cfg(any(feature = "cranelift", feature = "winch"))]
-pub use compile::CodeBuilder;
+pub use compile::{CodeBuilder, CodeHint};
 
 mod config;
 mod engine;

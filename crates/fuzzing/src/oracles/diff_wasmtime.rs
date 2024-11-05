@@ -24,11 +24,9 @@ impl WasmtimeEngine {
         config: &mut generators::Config,
         compiler_strategy: CompilerStrategy,
     ) -> arbitrary::Result<Self> {
-        if let CompilerStrategy::Winch = compiler_strategy {
-            config.disable_unimplemented_winch_proposals();
-        }
         let mut new_config = u.arbitrary::<WasmtimeConfig>()?;
         new_config.compiler_strategy = compiler_strategy;
+        new_config.update_module_config(&mut config.module_config.config, u)?;
         new_config.make_compatible_with(&config.wasmtime);
 
         let config = generators::Config {
@@ -57,8 +55,8 @@ impl DiffEngine for WasmtimeEngine {
     fn assert_error_match(&self, trap: &Trap, err: &Error) {
         let trap2 = err
             .downcast_ref::<Trap>()
-            .expect(&format!("not a trap: {:?}", err));
-        assert_eq!(trap, trap2, "{}\nis not equal to\n{}", trap, trap2);
+            .expect(&format!("not a trap: {err:?}"));
+        assert_eq!(trap, trap2, "{trap}\nis not equal to\n{trap2}");
     }
 
     fn is_stack_overflow(&self, err: &Error) -> bool {
@@ -241,19 +239,24 @@ impl Into<DiffValue> for Val {
     }
 }
 
-#[test]
-fn smoke_cranelift() {
-    crate::oracles::engine::smoke_test_engine(|u, config| {
-        WasmtimeEngine::new(u, config, CompilerStrategy::Cranelift)
-    })
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-#[test]
-fn smoke_winch() {
-    if !cfg!(target_arch = "x86_64") {
-        return;
+    #[test]
+    fn smoke_cranelift() {
+        crate::oracles::engine::smoke_test_engine(|u, config| {
+            WasmtimeEngine::new(u, config, CompilerStrategy::Cranelift)
+        })
     }
-    crate::oracles::engine::smoke_test_engine(|u, config| {
-        WasmtimeEngine::new(u, config, CompilerStrategy::Winch)
-    })
+
+    #[test]
+    fn smoke_winch() {
+        if !cfg!(target_arch = "x86_64") {
+            return;
+        }
+        crate::oracles::engine::smoke_test_engine(|u, config| {
+            WasmtimeEngine::new(u, config, CompilerStrategy::Winch)
+        })
+    }
 }

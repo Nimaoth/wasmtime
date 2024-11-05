@@ -1,23 +1,26 @@
 //! Assembler library implementation for Aarch64.
 
 use super::{address::Address, regs};
-use crate::masm::{FloatCmpKind, IntCmpKind, RoundingMode, ShiftKind};
-use crate::{masm::OperandSize, reg::Reg};
+use crate::masm::{ExtendKind, FloatCmpKind, IntCmpKind, RoundingMode, ShiftKind};
+use crate::{
+    masm::OperandSize,
+    reg::{writable, Reg, WritableReg},
+};
+use cranelift_codegen::ir::TrapCode;
 use cranelift_codegen::isa::aarch64::inst::{
     BitOp, BranchTarget, Cond, CondBrKind, FPULeftShiftImm, FPUOp1, FPUOp2,
     FPUOpRI::{self, UShr32, UShr64},
     FPUOpRIMod, FPURightShiftImm, FpuRoundMode, ImmLogic, ImmShift, ScalarSize,
 };
-use cranelift_codegen::MachInst;
 use cranelift_codegen::{
     ir::{MemFlags, SourceLoc},
     isa::aarch64::inst::{
         self,
         emit::{EmitInfo, EmitState},
-        ALUOp, ALUOp3, AMode, ExtendOp, Imm12, Inst, PairAMode,
+        ALUOp, ALUOp3, AMode, ExtendOp, Imm12, Inst, PairAMode, VecLanesOp, VecMisc2, VectorSize,
     },
-    settings, Final, MachBuffer, MachBufferFinalized, MachInstEmit, MachInstEmitState, MachLabel,
-    Writable,
+    settings, Final, MachBuffer, MachBufferFinalized, MachInst, MachInstEmit, MachInstEmitState,
+    MachLabel, Writable,
 };
 
 impl From<OperandSize> for inst::OperandSize {
@@ -25,7 +28,7 @@ impl From<OperandSize> for inst::OperandSize {
         match size {
             OperandSize::S32 => Self::Size32,
             OperandSize::S64 => Self::Size64,
-            s => panic!("Invalid operand size {:?}", s),
+            s => panic!("Invalid operand size {s:?}"),
         }
     }
 }
@@ -113,7 +116,7 @@ impl Assembler {
             let jmp = Inst::Jump {
                 dest: BranchTarget::Label(label),
             };
-            jmp.emit(&mut self.buffer, &mut self.emit_info, &mut self.emit_state);
+            jmp.emit(&mut self.buffer, &self.emit_info, &mut self.emit_state);
             self.buffer
                 .emit_island(needed_space, self.emit_state.ctrl_plane_mut());
             self.buffer
@@ -123,8 +126,8 @@ impl Assembler {
     }
 
     /// Load a constant into a register.
-    pub fn load_constant(&mut self, imm: u64, rd: Reg) {
-        let writable = Writable::from_reg(rd.into());
+    pub fn load_constant(&mut self, imm: u64, rd: WritableReg) {
+        let writable = rd.map(Into::into);
         Inst::load_constant(writable, imm, &mut |_| writable)
             .into_iter()
             .for_each(|i| self.emit(i));
@@ -147,43 +150,115 @@ impl Assembler {
         let flags = MemFlags::trusted();
 
         use OperandSize::*;
-        let inst = match size {
-            S64 => Inst::Store64 {
+        let inst = match (reg.is_int(), size) {
+            (_, S8) => Inst::Store8 {
                 rd: reg.into(),
                 mem,
                 flags,
             },
-            S32 => Inst::Store32 {
+            (_, S16) => Inst::Store16 {
                 rd: reg.into(),
                 mem,
                 flags,
             },
-
-            _ => unreachable!(),
+            (true, S32) => Inst::Store32 {
+                rd: reg.into(),
+                mem,
+                flags,
+            },
+            (false, S32) => Inst::FpuStore32 {
+                rd: reg.into(),
+                mem,
+                flags,
+            },
+            (true, S64) => Inst::Store64 {
+                rd: reg.into(),
+                mem,
+                flags,
+            },
+            (false, S64) => Inst::FpuStore64 {
+                rd: reg.into(),
+                mem,
+                flags,
+            },
+            (_, S128) => Inst::FpuStore128 {
+                rd: reg.into(),
+                mem,
+                flags,
+            },
         };
 
         self.emit(inst);
     }
 
+    /// Load a signed register.
+    pub fn sload(&mut self, addr: Address, rd: WritableReg, size: OperandSize) {
+        self.ldr(addr, rd, size, true);
+    }
+
+    /// Load an unsigned register.
+    pub fn uload(&mut self, addr: Address, rd: WritableReg, size: OperandSize) {
+        self.ldr(addr, rd, size, false);
+    }
+
     /// Load a register.
-    pub fn ldr(&mut self, addr: Address, rd: Reg, size: OperandSize) {
+    fn ldr(&mut self, addr: Address, rd: WritableReg, size: OperandSize, signed: bool) {
         use OperandSize::*;
-        let writable_reg = Writable::from_reg(rd.into());
+        let writable_reg = rd.map(Into::into);
         let mem: AMode = addr.try_into().unwrap();
         let flags = MemFlags::trusted();
 
-        let inst = match size {
-            S64 => Inst::ULoad64 {
+        let inst = match (rd.to_reg().is_int(), signed, size) {
+            (_, false, S8) => Inst::ULoad8 {
                 rd: writable_reg,
                 mem,
                 flags,
             },
-            S32 => Inst::ULoad32 {
+            (_, true, S8) => Inst::SLoad8 {
                 rd: writable_reg,
                 mem,
                 flags,
             },
-            _ => unreachable!(),
+            (_, false, S16) => Inst::ULoad16 {
+                rd: writable_reg,
+                mem,
+                flags,
+            },
+            (_, true, S16) => Inst::SLoad16 {
+                rd: writable_reg,
+                mem,
+                flags,
+            },
+            (true, false, S32) => Inst::ULoad32 {
+                rd: writable_reg,
+                mem,
+                flags,
+            },
+            (false, _, S32) => Inst::FpuLoad32 {
+                rd: writable_reg,
+                mem,
+                flags,
+            },
+            (true, true, S32) => Inst::SLoad32 {
+                rd: writable_reg,
+                mem,
+                flags,
+            },
+            (true, _, S64) => Inst::ULoad64 {
+                rd: writable_reg,
+                mem,
+                flags,
+            },
+            (false, _, S64) => Inst::FpuLoad64 {
+                rd: writable_reg,
+                mem,
+                flags,
+            },
+            (_, _, S128) => Inst::FpuLoad128 {
+                rd: writable_reg,
+                mem,
+                flags,
+            },
         };
 
         self.emit(inst);
@@ -204,8 +279,8 @@ impl Assembler {
     }
 
     /// Register to register move.
-    pub fn mov_rr(&mut self, rm: Reg, rd: Reg, size: OperandSize) {
-        let writable_rd = Writable::from_reg(rd.into());
+    pub fn mov_rr(&mut self, rm: Reg, rd: WritableReg, size: OperandSize) {
+        let writable_rd = rd.map(Into::into);
         self.emit(Inst::Mov {
             size: size.into(),
             rd: writable_rd,
@@ -214,8 +289,8 @@ impl Assembler {
     }
 
     /// Floating point register to register move.
-    pub fn fmov_rr(&mut self, rn: Reg, rd: Reg, size: OperandSize) {
-        let writable = Writable::from_reg(rd.into());
+    pub fn fmov_rr(&mut self, rn: Reg, rd: WritableReg, size: OperandSize) {
+        let writable = rd.map(Into::into);
         let inst = match size {
             OperandSize::S32 => Inst::FpuMove32 {
                 rd: writable,
@@ -231,8 +306,8 @@ impl Assembler {
         self.emit(inst);
     }
 
-    pub fn mov_to_fpu(&mut self, rn: Reg, rd: Reg, size: OperandSize) {
-        let writable_rd = Writable::from_reg(rd.into());
+    pub fn mov_to_fpu(&mut self, rn: Reg, rd: WritableReg, size: OperandSize) {
+        let writable_rd = rd.map(Into::into);
         self.emit(Inst::MovToFpu {
             size: size.into(),
             rd: writable_rd,
@@ -240,194 +315,227 @@ impl Assembler {
         });
     }
 
+    pub fn mov_from_vec(&mut self, rn: Reg, rd: Reg, idx: u8, size: OperandSize) {
+        self.emit(Inst::MovFromVec {
+            rd: Writable::from_reg(rd.into()),
+            rn: rn.into(),
+            idx,
+            size: size.into(),
+        });
+    }
+
     /// Add with three registers.
-    pub fn add_rrr(&mut self, rm: Reg, rn: Reg, rd: Reg, size: OperandSize) {
+    pub fn add_rrr(&mut self, rm: Reg, rn: Reg, rd: WritableReg, size: OperandSize) {
         self.emit_alu_rrr_extend(ALUOp::Add, rm, rn, rd, size);
     }
 
     /// Add immediate and register.
-    pub fn add_ir(&mut self, imm: u64, rn: Reg, rd: Reg, size: OperandSize) {
+    pub fn add_ir(&mut self, imm: u64, rn: Reg, rd: WritableReg, size: OperandSize) {
         let alu_op = ALUOp::Add;
         if let Some(imm) = Imm12::maybe_from_u64(imm) {
             self.emit_alu_rri(alu_op, imm, rn, rd, size);
         } else {
             let scratch = regs::scratch();
-            self.load_constant(imm, scratch);
+            self.load_constant(imm, writable!(scratch));
             self.emit_alu_rrr_extend(alu_op, scratch, rn, rd, size);
         }
     }
 
+    /// Add across Vector.
+    pub fn addv(&mut self, rn: Reg, rd: Reg, size: VectorSize) {
+        self.emit(Inst::VecLanes {
+            op: VecLanesOp::Addv,
+            rd: Writable::from_reg(rd.into()),
+            rn: rn.into(),
+            size,
+        });
+    }
+
     /// Subtract with three registers.
-    pub fn sub_rrr(&mut self, rm: Reg, rn: Reg, rd: Reg, size: OperandSize) {
+    pub fn sub_rrr(&mut self, rm: Reg, rn: Reg, rd: WritableReg, size: OperandSize) {
         self.emit_alu_rrr_extend(ALUOp::Sub, rm, rn, rd, size);
     }
 
     /// Subtract immediate and register.
-    pub fn sub_ir(&mut self, imm: u64, rn: Reg, rd: Reg, size: OperandSize) {
+    pub fn sub_ir(&mut self, imm: u64, rn: Reg, rd: WritableReg, size: OperandSize) {
         let alu_op = ALUOp::Sub;
         if let Some(imm) = Imm12::maybe_from_u64(imm) {
             self.emit_alu_rri(alu_op, imm, rn, rd, size);
         } else {
             let scratch = regs::scratch();
-            self.load_constant(imm, scratch);
+            self.load_constant(imm, writable!(scratch));
             self.emit_alu_rrr_extend(alu_op, scratch, rn, rd, size);
         }
     }
 
     /// Subtract with three registers, setting flags.
     pub fn subs_rrr(&mut self, rm: Reg, rn: Reg, size: OperandSize) {
-        self.emit_alu_rrr_extend(ALUOp::SubS, rm, rn, regs::zero(), size);
+        self.emit_alu_rrr_extend(ALUOp::SubS, rm, rn, writable!(regs::zero()), size);
     }
 
     /// Subtract immediate and register, setting flags.
     pub fn subs_ir(&mut self, imm: u64, rn: Reg, size: OperandSize) {
         let alu_op = ALUOp::SubS;
         if let Some(imm) = Imm12::maybe_from_u64(imm) {
-            self.emit_alu_rri(alu_op, imm, rn, regs::zero(), size);
+            self.emit_alu_rri(alu_op, imm, rn, writable!(regs::zero()), size);
         } else {
             let scratch = regs::scratch();
-            self.load_constant(imm, scratch);
-            self.emit_alu_rrr_extend(alu_op, scratch, rn, regs::zero(), size);
+            self.load_constant(imm, writable!(scratch));
+            self.emit_alu_rrr_extend(alu_op, scratch, rn, writable!(regs::zero()), size);
         }
     }
 
     /// Multiply with three registers.
-    pub fn mul_rrr(&mut self, rm: Reg, rn: Reg, rd: Reg, size: OperandSize) {
+    pub fn mul_rrr(&mut self, rm: Reg, rn: Reg, rd: WritableReg, size: OperandSize) {
         self.emit_alu_rrrr(ALUOp3::MAdd, rm, rn, rd, regs::zero(), size);
     }
 
     /// Multiply immediate and register.
-    pub fn mul_ir(&mut self, imm: u64, rn: Reg, rd: Reg, size: OperandSize) {
+    pub fn mul_ir(&mut self, imm: u64, rn: Reg, rd: WritableReg, size: OperandSize) {
         let scratch = regs::scratch();
-        self.load_constant(imm, scratch);
+        self.load_constant(imm, writable!(scratch));
         self.emit_alu_rrrr(ALUOp3::MAdd, scratch, rn, rd, regs::zero(), size);
     }
 
     /// And with three registers.
-    pub fn and_rrr(&mut self, rm: Reg, rn: Reg, rd: Reg, size: OperandSize) {
+    pub fn and_rrr(&mut self, rm: Reg, rn: Reg, rd: WritableReg, size: OperandSize) {
         self.emit_alu_rrr(ALUOp::And, rm, rn, rd, size);
     }
 
     /// And immediate and register.
-    pub fn and_ir(&mut self, imm: u64, rn: Reg, rd: Reg, size: OperandSize) {
+    pub fn and_ir(&mut self, imm: u64, rn: Reg, rd: WritableReg, size: OperandSize) {
         let alu_op = ALUOp::And;
         let cl_size: inst::OperandSize = size.into();
         if let Some(imm) = ImmLogic::maybe_from_u64(imm, cl_size.to_ty()) {
             self.emit_alu_rri_logic(alu_op, imm, rn, rd, size);
         } else {
             let scratch = regs::scratch();
-            self.load_constant(imm, scratch);
+            self.load_constant(imm, writable!(scratch));
             self.emit_alu_rrr(alu_op, scratch, rn, rd, size);
         }
     }
 
     /// Or with three registers.
-    pub fn or_rrr(&mut self, rm: Reg, rn: Reg, rd: Reg, size: OperandSize) {
+    pub fn or_rrr(&mut self, rm: Reg, rn: Reg, rd: WritableReg, size: OperandSize) {
         self.emit_alu_rrr(ALUOp::Orr, rm, rn, rd, size);
     }
 
     /// Or immediate and register.
-    pub fn or_ir(&mut self, imm: u64, rn: Reg, rd: Reg, size: OperandSize) {
+    pub fn or_ir(&mut self, imm: u64, rn: Reg, rd: WritableReg, size: OperandSize) {
         let alu_op = ALUOp::Orr;
         let cl_size: inst::OperandSize = size.into();
         if let Some(imm) = ImmLogic::maybe_from_u64(imm, cl_size.to_ty()) {
             self.emit_alu_rri_logic(alu_op, imm, rn, rd, size);
         } else {
             let scratch = regs::scratch();
-            self.load_constant(imm, scratch);
+            self.load_constant(imm, writable!(scratch));
             self.emit_alu_rrr(alu_op, scratch, rn, rd, size);
         }
     }
 
     /// Xor with three registers.
-    pub fn xor_rrr(&mut self, rm: Reg, rn: Reg, rd: Reg, size: OperandSize) {
+    pub fn xor_rrr(&mut self, rm: Reg, rn: Reg, rd: WritableReg, size: OperandSize) {
         self.emit_alu_rrr(ALUOp::Eor, rm, rn, rd, size);
     }
 
     /// Xor immediate and register.
-    pub fn xor_ir(&mut self, imm: u64, rn: Reg, rd: Reg, size: OperandSize) {
+    pub fn xor_ir(&mut self, imm: u64, rn: Reg, rd: WritableReg, size: OperandSize) {
         let alu_op = ALUOp::Eor;
         let cl_size: inst::OperandSize = size.into();
         if let Some(imm) = ImmLogic::maybe_from_u64(imm, cl_size.to_ty()) {
             self.emit_alu_rri_logic(alu_op, imm, rn, rd, size);
         } else {
             let scratch = regs::scratch();
-            self.load_constant(imm, scratch);
+            self.load_constant(imm, writable!(scratch));
             self.emit_alu_rrr(alu_op, scratch, rn, rd, size);
         }
     }
 
     /// Shift with three registers.
-    pub fn shift_rrr(&mut self, rm: Reg, rn: Reg, rd: Reg, kind: ShiftKind, size: OperandSize) {
+    pub fn shift_rrr(
+        &mut self,
+        rm: Reg,
+        rn: Reg,
+        rd: WritableReg,
+        kind: ShiftKind,
+        size: OperandSize,
+    ) {
         let shift_op = self.shift_kind_to_alu_op(kind, rm, size);
         self.emit_alu_rrr(shift_op, rm, rn, rd, size);
     }
 
     /// Shift immediate and register.
-    pub fn shift_ir(&mut self, imm: u64, rn: Reg, rd: Reg, kind: ShiftKind, size: OperandSize) {
+    pub fn shift_ir(
+        &mut self,
+        imm: u64,
+        rn: Reg,
+        rd: WritableReg,
+        kind: ShiftKind,
+        size: OperandSize,
+    ) {
         let shift_op = self.shift_kind_to_alu_op(kind, rn, size);
 
         if let Some(imm) = ImmShift::maybe_from_u64(imm) {
             self.emit_alu_rri_shift(shift_op, imm, rn, rd, size);
         } else {
             let scratch = regs::scratch();
-            self.load_constant(imm, scratch);
+            self.load_constant(imm, writable!(scratch));
             self.emit_alu_rrr(shift_op, scratch, rn, rd, size);
         }
     }
 
     /// Count Leading Zeros.
-    pub fn clz(&mut self, rn: Reg, rd: Reg, size: OperandSize) {
+    pub fn clz(&mut self, rn: Reg, rd: WritableReg, size: OperandSize) {
         self.emit_bit_rr(BitOp::Clz, rn, rd, size);
     }
 
     /// Reverse Bits reverses the bit order in a register.
-    pub fn rbit(&mut self, rn: Reg, rd: Reg, size: OperandSize) {
+    pub fn rbit(&mut self, rn: Reg, rd: WritableReg, size: OperandSize) {
         self.emit_bit_rr(BitOp::RBit, rn, rd, size);
     }
 
     /// Float add with three registers.
-    pub fn fadd_rrr(&mut self, rm: Reg, rn: Reg, rd: Reg, size: OperandSize) {
+    pub fn fadd_rrr(&mut self, rm: Reg, rn: Reg, rd: WritableReg, size: OperandSize) {
         self.emit_fpu_rrr(FPUOp2::Add, rm, rn, rd, size);
     }
 
     /// Float sub with three registers.
-    pub fn fsub_rrr(&mut self, rm: Reg, rn: Reg, rd: Reg, size: OperandSize) {
+    pub fn fsub_rrr(&mut self, rm: Reg, rn: Reg, rd: WritableReg, size: OperandSize) {
         self.emit_fpu_rrr(FPUOp2::Sub, rm, rn, rd, size);
     }
 
     /// Float multiply with three registers.
-    pub fn fmul_rrr(&mut self, rm: Reg, rn: Reg, rd: Reg, size: OperandSize) {
+    pub fn fmul_rrr(&mut self, rm: Reg, rn: Reg, rd: WritableReg, size: OperandSize) {
         self.emit_fpu_rrr(FPUOp2::Mul, rm, rn, rd, size);
     }
 
     /// Float division with three registers.
-    pub fn fdiv_rrr(&mut self, rm: Reg, rn: Reg, rd: Reg, size: OperandSize) {
+    pub fn fdiv_rrr(&mut self, rm: Reg, rn: Reg, rd: WritableReg, size: OperandSize) {
         self.emit_fpu_rrr(FPUOp2::Div, rm, rn, rd, size);
     }
 
     /// Float max with three registers.
-    pub fn fmax_rrr(&mut self, rm: Reg, rn: Reg, rd: Reg, size: OperandSize) {
+    pub fn fmax_rrr(&mut self, rm: Reg, rn: Reg, rd: WritableReg, size: OperandSize) {
         self.emit_fpu_rrr(FPUOp2::Max, rm, rn, rd, size);
     }
 
     /// Float min with three registers.
-    pub fn fmin_rrr(&mut self, rm: Reg, rn: Reg, rd: Reg, size: OperandSize) {
+    pub fn fmin_rrr(&mut self, rm: Reg, rn: Reg, rd: WritableReg, size: OperandSize) {
         self.emit_fpu_rrr(FPUOp2::Min, rm, rn, rd, size);
     }
 
     /// Float neg with two registers.
-    pub fn fneg_rr(&mut self, rn: Reg, rd: Reg, size: OperandSize) {
+    pub fn fneg_rr(&mut self, rn: Reg, rd: WritableReg, size: OperandSize) {
         self.emit_fpu_rr(FPUOp1::Neg, rn, rd, size);
     }
 
     /// Float abs with two registers.
-    pub fn fabs_rr(&mut self, rn: Reg, rd: Reg, size: OperandSize) {
+    pub fn fabs_rr(&mut self, rn: Reg, rd: WritableReg, size: OperandSize) {
         self.emit_fpu_rr(FPUOp1::Abs, rn, rd, size);
     }
 
     /// Float sqrt with two registers.
-    pub fn fsqrt_rr(&mut self, rn: Reg, rd: Reg, size: OperandSize) {
+    pub fn fsqrt_rr(&mut self, rn: Reg, rd: WritableReg, size: OperandSize) {
         self.emit_fpu_rr(FPUOp1::Sqrt, rn, rd, size);
     }
 
@@ -442,15 +550,15 @@ impl Assembler {
             (RoundingMode::Up, OperandSize::S64) => FpuRoundMode::Plus64,
             (RoundingMode::Down, OperandSize::S64) => FpuRoundMode::Minus64,
             (RoundingMode::Zero, OperandSize::S64) => FpuRoundMode::Zero64,
-            (m, o) => panic!("Invalid rounding mode or operand size {:?}, {:?}", m, o),
+            (m, o) => panic!("Invalid rounding mode or operand size {m:?}, {o:?}"),
         };
         self.emit_fpu_round(fpu_mode, rn, rd)
     }
 
     /// Float unsigned shift right with two registers and an immediate.
-    pub fn fushr_rri(&mut self, rn: Reg, rd: Reg, amount: u8, size: OperandSize) {
+    pub fn fushr_rri(&mut self, rn: Reg, rd: WritableReg, amount: u8, size: OperandSize) {
         let imm = FPURightShiftImm {
-            amount: amount,
+            amount,
             lane_size_in_bits: size.num_bits(),
         };
         let ushr = match size {
@@ -463,9 +571,16 @@ impl Assembler {
 
     /// Float unsigned shift left and insert with three registers
     /// and an immediate.
-    pub fn fsli_rri_mod(&mut self, ri: Reg, rn: Reg, rd: Reg, amount: u8, size: OperandSize) {
+    pub fn fsli_rri_mod(
+        &mut self,
+        ri: Reg,
+        rn: Reg,
+        rd: WritableReg,
+        amount: u8,
+        size: OperandSize,
+    ) {
         let imm = FPULeftShiftImm {
-            amount: amount,
+            amount,
             lane_size_in_bits: size.num_bits(),
         };
         let sli = match size {
@@ -483,6 +598,27 @@ impl Assembler {
             rn: rn.into(),
             rm: rm.into(),
         })
+    }
+
+    /// Change precision of float.
+    pub fn cvt_float_to_float(
+        &mut self,
+        rn: Reg,
+        rd: WritableReg,
+        src_size: OperandSize,
+        dst_size: OperandSize,
+    ) {
+        let (fpu_op, size) = match (src_size, dst_size) {
+            (OperandSize::S32, OperandSize::S64) => (FPUOp1::Cvt32To64, ScalarSize::Size32),
+            (OperandSize::S64, OperandSize::S32) => (FPUOp1::Cvt64To32, ScalarSize::Size64),
+            _ => unimplemented!(),
+        };
+        self.emit(Inst::FpuRR {
+            fpu_op,
+            size,
+            rd: rd.map(Into::into),
+            rn: rn.into(),
+        });
     }
 
     /// Return instruction.
@@ -532,25 +668,69 @@ impl Assembler {
 
     /// Conditional Set sets the destination register to 1 if the condition
     /// is true, and otherwise sets it to 0.
-    pub fn cset(&mut self, rd: Reg, cond: Cond) {
+    pub fn cset(&mut self, rd: WritableReg, cond: Cond) {
         self.emit(Inst::CSet {
-            rd: Writable::from_reg(rd.into()),
+            rd: rd.map(Into::into),
             cond,
         });
     }
 
+    // If the condition is true, Conditional Select writes rm to rd. If the condition is false,
+    // it writes rn to rd
+    pub fn csel(&mut self, rm: Reg, rn: Reg, rd: WritableReg, cond: Cond) {
+        self.emit(Inst::CSel {
+            rd: rd.map(Into::into),
+            rm: rm.into(),
+            rn: rn.into(),
+            cond,
+        });
+    }
+
+    // Population Count per byte.
+    pub fn cnt(&mut self, rd: Reg) {
+        self.emit(Inst::VecMisc {
+            op: VecMisc2::Cnt,
+            rd: Writable::from_reg(rd.into()),
+            rn: rd.into(),
+            size: VectorSize::Size8x8,
+        });
+    }
+
+    pub fn extend(&mut self, rn: Reg, rd: WritableReg, kind: ExtendKind) {
+        self.emit(Inst::Extend {
+            rd: rd.map(Into::into),
+            rn: rn.into(),
+            signed: kind.signed(),
+            from_bits: kind.from_bits(),
+            to_bits: kind.to_bits(),
+        })
+    }
+
     /// Bitwise AND (shifted register), setting flags.
     pub fn ands_rr(&mut self, rn: Reg, rm: Reg, size: OperandSize) {
-        self.emit_alu_rrr(ALUOp::AndS, rm, rn, regs::zero(), size);
+        self.emit_alu_rrr(ALUOp::AndS, rm, rn, writable!(regs::zero()), size);
+    }
+
+    /// Permanently Undefined.
+    pub fn udf(&mut self, code: TrapCode) {
+        self.emit(Inst::Udf { trap_code: code });
+    }
+
+    /// Conditional trap.
+    pub fn trapif(&mut self, cc: Cond, code: TrapCode) {
+        self.emit(Inst::TrapIf {
+            kind: CondBrKind::Cond(cc),
+            trap_code: code,
+        });
     }
 
     // Helpers for ALU operations.
 
-    fn emit_alu_rri(&mut self, op: ALUOp, imm: Imm12, rn: Reg, rd: Reg, size: OperandSize) {
+    fn emit_alu_rri(&mut self, op: ALUOp, imm: Imm12, rn: Reg, rd: WritableReg, size: OperandSize) {
         self.emit(Inst::AluRRImm12 {
             alu_op: op,
             size: size.into(),
-            rd: Writable::from_reg(rd.into()),
+            rd: rd.map(Into::into),
             rn: rn.into(),
             imm12: imm,
         });
@@ -561,13 +741,13 @@ impl Assembler {
         op: ALUOp,
         imm: ImmLogic,
         rn: Reg,
-        rd: Reg,
+        rd: WritableReg,
         size: OperandSize,
     ) {
         self.emit(Inst::AluRRImmLogic {
             alu_op: op,
             size: size.into(),
-            rd: Writable::from_reg(rd.into()),
+            rd: rd.map(Into::into),
             rn: rn.into(),
             imml: imm,
         });
@@ -578,82 +758,97 @@ impl Assembler {
         op: ALUOp,
         imm: ImmShift,
         rn: Reg,
-        rd: Reg,
+        rd: WritableReg,
         size: OperandSize,
     ) {
         self.emit(Inst::AluRRImmShift {
             alu_op: op,
             size: size.into(),
-            rd: Writable::from_reg(rd.into()),
+            rd: rd.map(Into::into),
             rn: rn.into(),
             immshift: imm,
         });
     }
 
-    fn emit_alu_rrr(&mut self, op: ALUOp, rm: Reg, rn: Reg, rd: Reg, size: OperandSize) {
+    fn emit_alu_rrr(&mut self, op: ALUOp, rm: Reg, rn: Reg, rd: WritableReg, size: OperandSize) {
         self.emit(Inst::AluRRR {
             alu_op: op,
             size: size.into(),
-            rd: Writable::from_reg(rd.into()),
+            rd: rd.map(Into::into),
             rn: rn.into(),
             rm: rm.into(),
         });
     }
 
-    fn emit_alu_rrr_extend(&mut self, op: ALUOp, rm: Reg, rn: Reg, rd: Reg, size: OperandSize) {
+    fn emit_alu_rrr_extend(
+        &mut self,
+        op: ALUOp,
+        rm: Reg,
+        rn: Reg,
+        rd: WritableReg,
+        size: OperandSize,
+    ) {
         self.emit(Inst::AluRRRExtend {
             alu_op: op,
             size: size.into(),
-            rd: Writable::from_reg(rd.into()),
+            rd: rd.map(Into::into),
             rn: rn.into(),
             rm: rm.into(),
             extendop: ExtendOp::UXTX,
         });
     }
 
-    fn emit_alu_rrrr(&mut self, op: ALUOp3, rm: Reg, rn: Reg, rd: Reg, ra: Reg, size: OperandSize) {
+    fn emit_alu_rrrr(
+        &mut self,
+        op: ALUOp3,
+        rm: Reg,
+        rn: Reg,
+        rd: WritableReg,
+        ra: Reg,
+        size: OperandSize,
+    ) {
         self.emit(Inst::AluRRRR {
             alu_op: op,
             size: size.into(),
-            rd: Writable::from_reg(rd.into()),
+            rd: rd.map(Into::into),
             rn: rn.into(),
             rm: rm.into(),
             ra: ra.into(),
         });
     }
 
-    fn emit_fpu_rrr(&mut self, op: FPUOp2, rm: Reg, rn: Reg, rd: Reg, size: OperandSize) {
+    fn emit_fpu_rrr(&mut self, op: FPUOp2, rm: Reg, rn: Reg, rd: WritableReg, size: OperandSize) {
         self.emit(Inst::FpuRRR {
             fpu_op: op,
             size: size.into(),
-            rd: Writable::from_reg(rd.into()),
+            rd: rd.map(Into::into),
             rn: rn.into(),
             rm: rm.into(),
         });
     }
 
-    fn emit_fpu_rri(&mut self, op: FPUOpRI, rn: Reg, rd: Reg) {
+    fn emit_fpu_rri(&mut self, op: FPUOpRI, rn: Reg, rd: WritableReg) {
         self.emit(Inst::FpuRRI {
             fpu_op: op,
-            rd: Writable::from_reg(rd.into()),
+            rd: rd.map(Into::into),
             rn: rn.into(),
         });
     }
 
-    fn emit_fpu_rri_mod(&mut self, op: FPUOpRIMod, ri: Reg, rn: Reg, rd: Reg) {
+    fn emit_fpu_rri_mod(&mut self, op: FPUOpRIMod, ri: Reg, rn: Reg, rd: WritableReg) {
         self.emit(Inst::FpuRRIMod {
             fpu_op: op,
-            rd: Writable::from_reg(rd.into()),
+            rd: rd.map(Into::into),
             ri: ri.into(),
             rn: rn.into(),
         });
     }
 
-    fn emit_fpu_rr(&mut self, op: FPUOp1, rn: Reg, rd: Reg, size: OperandSize) {
+    fn emit_fpu_rr(&mut self, op: FPUOp1, rn: Reg, rd: WritableReg, size: OperandSize) {
         self.emit(Inst::FpuRR {
             fpu_op: op,
             size: size.into(),
-            rd: Writable::from_reg(rd.into()),
+            rd: rd.map(Into::into),
             rn: rn.into(),
         });
     }
@@ -666,11 +861,11 @@ impl Assembler {
         });
     }
 
-    fn emit_bit_rr(&mut self, op: BitOp, rn: Reg, rd: Reg, size: OperandSize) {
+    fn emit_bit_rr(&mut self, op: BitOp, rn: Reg, rd: WritableReg, size: OperandSize) {
         self.emit(Inst::BitRR {
             op,
             size: size.into(),
-            rd: Writable::from_reg(rd.into()),
+            rd: rd.map(Into::into),
             rn: rn.into(),
         });
     }
@@ -685,7 +880,7 @@ impl Assembler {
             ShiftKind::Rotr => ALUOp::RotR,
             ShiftKind::Rotl => {
                 // neg(r) is sub(zero, r).
-                self.emit_alu_rrr(ALUOp::Sub, regs::zero(), r, r, size);
+                self.emit_alu_rrr(ALUOp::Sub, regs::zero(), r, writable!(r), size);
                 ALUOp::RotR
             }
         }

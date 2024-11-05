@@ -1,7 +1,6 @@
 //! S390x ISA: binary code emission.
 
-use crate::binemit::StackMap;
-use crate::ir::{self, MemFlags, TrapCode};
+use crate::ir::{self, LibCall, MemFlags, TrapCode};
 use crate::isa::s390x::inst::*;
 use crate::isa::s390x::settings as s390x_settings;
 use cranelift_control::ControlPlane;
@@ -1320,10 +1319,6 @@ pub struct EmitState {
     /// ABI, between the AllocateArgs and the actual call instruction.
     pub(crate) nominal_sp_offset: u32,
 
-    /// Safepoint stack map for upcoming instruction, as provided to
-    /// `pre_safepoint()`.
-    stack_map: Option<StackMap>,
-
     /// The user stack map for the upcoming instruction, as provided to
     /// `pre_safepoint()`.
     user_stack_map: Option<ir::UserStackMap>,
@@ -1339,19 +1334,13 @@ impl MachInstEmitState<Inst> for EmitState {
     fn new(abi: &Callee<S390xMachineDeps>, ctrl_plane: ControlPlane) -> Self {
         EmitState {
             nominal_sp_offset: 0,
-            stack_map: None,
             user_stack_map: None,
             ctrl_plane,
             frame_layout: abi.frame_layout().clone(),
         }
     }
 
-    fn pre_safepoint(
-        &mut self,
-        stack_map: Option<StackMap>,
-        user_stack_map: Option<ir::UserStackMap>,
-    ) {
-        self.stack_map = stack_map;
+    fn pre_safepoint(&mut self, user_stack_map: Option<ir::UserStackMap>) {
         self.user_stack_map = user_stack_map;
     }
 
@@ -1369,12 +1358,12 @@ impl MachInstEmitState<Inst> for EmitState {
 }
 
 impl EmitState {
-    fn take_stack_map(&mut self) -> (Option<StackMap>, Option<ir::UserStackMap>) {
-        (self.stack_map.take(), self.user_stack_map.take())
+    fn take_stack_map(&mut self) -> Option<ir::UserStackMap> {
+        self.user_stack_map.take()
     }
 
     fn clear_post_insn(&mut self) {
-        self.stack_map = None;
+        self.user_stack_map = None;
     }
 }
 
@@ -1423,8 +1412,7 @@ impl Inst {
         let isa_requirements = self.available_in_isa();
         if !matches_isa_flags(&isa_requirements) {
             panic!(
-                "Cannot emit inst '{:?}' for target; failed to match ISA requirements: {:?}",
-                self, isa_requirements
+                "Cannot emit inst '{self:?}' for target; failed to match ISA requirements: {isa_requirements:?}"
             )
         }
 
@@ -1701,7 +1689,7 @@ impl Inst {
                 debug_assert_eq!(rd2.to_reg(), ri);
 
                 let opcode = 0xb91d; // DSGFR
-                let trap_code = TrapCode::IntegerDivisionByZero;
+                let trap_code = TrapCode::INTEGER_DIVISION_BY_ZERO;
                 put_with_trap(sink, &enc_rre(opcode, rd1.to_reg(), rn), trap_code);
             }
             &Inst::SDivMod64 { rd, ri, rn } => {
@@ -1711,7 +1699,7 @@ impl Inst {
                 debug_assert_eq!(rd2.to_reg(), ri);
 
                 let opcode = 0xb90d; // DSGR
-                let trap_code = TrapCode::IntegerDivisionByZero;
+                let trap_code = TrapCode::INTEGER_DIVISION_BY_ZERO;
                 put_with_trap(sink, &enc_rre(opcode, rd1.to_reg(), rn), trap_code);
             }
             &Inst::UDivMod32 { rd, ri, rn } => {
@@ -1724,7 +1712,7 @@ impl Inst {
                 debug_assert_eq!(rd2.to_reg(), ri2);
 
                 let opcode = 0xb997; // DLR
-                let trap_code = TrapCode::IntegerDivisionByZero;
+                let trap_code = TrapCode::INTEGER_DIVISION_BY_ZERO;
                 put_with_trap(sink, &enc_rre(opcode, rd1.to_reg(), rn), trap_code);
             }
             &Inst::UDivMod64 { rd, ri, rn } => {
@@ -1737,7 +1725,7 @@ impl Inst {
                 debug_assert_eq!(rd2.to_reg(), ri2);
 
                 let opcode = 0xb987; // DLGR
-                let trap_code = TrapCode::IntegerDivisionByZero;
+                let trap_code = TrapCode::INTEGER_DIVISION_BY_ZERO;
                 put_with_trap(sink, &enc_rre(opcode, rd1.to_reg(), rn), trap_code);
             }
             &Inst::Flogr { rd, rn } => {
@@ -1895,8 +1883,7 @@ impl Inst {
                     (false, 32, 64) => 0xb916, // LLGFR
                     (true, 32, 64) => 0xb914,  // LGFR
                     _ => panic!(
-                        "Unsupported extend combination: signed = {}, from_bits = {}, to_bits = {}",
-                        signed, from_bits, to_bits
+                        "Unsupported extend combination: signed = {signed}, from_bits = {from_bits}, to_bits = {to_bits}"
                     ),
                 };
                 put(sink, &enc_rre(opcode, rd.to_reg(), rn));
@@ -3280,20 +3267,7 @@ impl Inst {
                 // works correctly.
                 sink.add_reloc_at_offset(2, Reloc::S390xPLTRel32Dbl, &info.dest, 2);
 
-                // Add relocation for TLS libcalls to enable linker optimizations.
-                match &info.tls_symbol {
-                    None => {}
-                    Some(SymbolReloc::TlsGd { name }) => {
-                        sink.add_reloc(Reloc::S390xTlsGdCall, name, 0)
-                    }
-                    _ => unreachable!(),
-                }
-
-                let (stack_map, user_stack_map) = state.take_stack_map();
-                if let Some(s) = stack_map {
-                    sink.add_stack_map(StackMapExtent::UpcomingBytes(6), s);
-                }
-                if let Some(s) = user_stack_map {
+                if let Some(s) = state.take_stack_map() {
                     let offset = sink.cur_offset() + 6;
                     sink.push_user_stack_map(state, offset, s);
                 }
@@ -3305,19 +3279,14 @@ impl Inst {
             }
             &Inst::CallInd { link, ref info } => {
                 debug_assert_eq!(link.to_reg(), gpr(14));
-                let rn = info.rn;
 
-                let (stack_map, user_stack_map) = state.take_stack_map();
-                if let Some(s) = stack_map {
-                    sink.add_stack_map(StackMapExtent::UpcomingBytes(2), s);
-                }
-                if let Some(s) = user_stack_map {
+                if let Some(s) = state.take_stack_map() {
                     let offset = sink.cur_offset() + 2;
                     sink.push_user_stack_map(state, offset, s);
                 }
 
                 let opcode = 0x0d; // BASR
-                put(sink, &enc_rr(opcode, link.to_reg(), rn));
+                put(sink, &enc_rr(opcode, link.to_reg(), info.dest));
                 sink.add_call_site();
 
                 state.nominal_sp_offset -= info.callee_pop_size;
@@ -3337,7 +3306,7 @@ impl Inst {
                 sink.add_call_site();
             }
             &Inst::ReturnCallInd { ref info } => {
-                let mut rn = info.rn;
+                let mut rn = info.dest;
                 for inst in S390xMachineDeps::gen_tail_epilogue(
                     state.frame_layout(),
                     info.callee_pop_size,
@@ -3348,6 +3317,26 @@ impl Inst {
 
                 let opcode = 0x07; // BCR
                 put(sink, &enc_rr(opcode, gpr(15), rn));
+                sink.add_call_site();
+            }
+            &Inst::ElfTlsGetOffset {
+                ref symbol, link, ..
+            } => {
+                debug_assert_eq!(link.to_reg(), gpr(14));
+
+                let opcode = 0xc05; // BRASL
+
+                // Add relocation for target function. This has to be done
+                // *before* the S390xTlsGdCall, to ensure linker relaxation
+                // works correctly.
+                let dest = ExternalName::LibCall(LibCall::ElfTlsGetOffset);
+                sink.add_reloc_at_offset(2, Reloc::S390xPLTRel32Dbl, &dest, 2);
+                match &**symbol {
+                    SymbolReloc::TlsGd { name } => sink.add_reloc(Reloc::S390xTlsGdCall, name, 0),
+                    _ => unreachable!(),
+                }
+
+                put(sink, &enc_ril_b(opcode, gpr(14), 0));
                 sink.add_call_site();
             }
             &Inst::Args { .. } => {}

@@ -420,7 +420,7 @@ impl<'a> FunctionBuilder<'a> {
     /// Panics if the variable has already been declared.
     pub fn declare_var(&mut self, var: Variable, ty: Type) {
         self.try_declare_var(var, ty)
-            .unwrap_or_else(|_| panic!("the variable {:?} has been declared multiple times", var))
+            .unwrap_or_else(|_| panic!("the variable {var:?} has been declared multiple times"))
     }
 
     /// Declare that all uses of the given variable must be included in stack
@@ -438,6 +438,7 @@ impl<'a> FunctionBuilder<'a> {
     /// Panics if the variable's type is larger than 16 bytes or if this
     /// variable has not been declared yet.
     pub fn declare_var_needs_stack_map(&mut self, var: Variable) {
+        log::trace!("declare_var_needs_stack_map({var:?})");
         let ty = self.func_ctx.types[var];
         assert!(ty != types::INVALID);
         assert!(ty.bytes() <= 16);
@@ -462,8 +463,7 @@ impl<'a> FunctionBuilder<'a> {
             debug_assert_ne!(
                 ty,
                 types::INVALID,
-                "variable {:?} is used but its type has not been declared",
-                var
+                "variable {var:?} is used but its type has not been declared"
             );
             self.func_ctx
                 .ssa
@@ -484,10 +484,7 @@ impl<'a> FunctionBuilder<'a> {
     /// position of a previously defined user variable.
     pub fn use_var(&mut self, var: Variable) -> Value {
         self.try_use_var(var).unwrap_or_else(|_| {
-            panic!(
-                "variable {:?} is used but its type has not been declared",
-                var
-            )
+            panic!("variable {var:?} is used but its type has not been declared")
         })
     }
 
@@ -519,16 +516,10 @@ impl<'a> FunctionBuilder<'a> {
         self.try_def_var(var, val)
             .unwrap_or_else(|error| match error {
                 DefVariableError::TypeMismatch(var, val) => {
-                    panic!(
-                        "declared type of variable {:?} doesn't match type of value {}",
-                        var, val
-                    );
+                    panic!("declared type of variable {var:?} doesn't match type of value {val}");
                 }
                 DefVariableError::DefinedBeforeDeclared(var) => {
-                    panic!(
-                        "variable {:?} is used but its type has not been declared",
-                        var
-                    );
+                    panic!("variable {var:?} is used but its type has not been declared");
                 }
             })
     }
@@ -570,6 +561,8 @@ impl<'a> FunctionBuilder<'a> {
     ///
     /// Panics if `val` is larger than 16 bytes.
     pub fn declare_value_needs_stack_map(&mut self, val: Value) {
+        log::trace!("declare_value_needs_stack_map({val:?})");
+
         // We rely on these properties in `insert_safepoint_spills`.
         let size = self.func.dfg.value_type(val).bytes();
         assert!(size <= 16);
@@ -703,13 +696,11 @@ impl<'a> FunctionBuilder<'a> {
                 if !self.is_pristine(block) {
                     assert!(
                         self.func_ctx.ssa.is_sealed(block),
-                        "FunctionBuilder finalized, but block {} is not sealed",
-                        block,
+                        "FunctionBuilder finalized, but block {block} is not sealed",
                     );
                     assert!(
                         self.is_filled(block),
-                        "FunctionBuilder finalized, but block {} is not filled",
-                        block,
+                        "FunctionBuilder finalized, but block {block} is not filled",
                     );
                 }
             }
@@ -722,10 +713,7 @@ impl<'a> FunctionBuilder<'a> {
             for block in self.func_ctx.status.keys() {
                 if let Err((inst, msg)) = self.func.is_block_basic(block) {
                     let inst_str = self.func.dfg.display_inst(inst);
-                    panic!(
-                        "{} failed basic block invariants on {}: {}",
-                        block, inst_str, msg
-                    );
+                    panic!("{block} failed basic block invariants on {inst_str}: {msg}");
                 }
             }
         }
@@ -1128,7 +1116,7 @@ impl<'a> FunctionBuilder<'a> {
             | SignedGreaterThanOrEqual
             | SignedGreaterThan
             | SignedLessThanOrEqual => {
-                panic!("Signed comparison {} not supported by memcmp", int_cc)
+                panic!("Signed comparison {int_cc} not supported by memcmp")
             }
         };
 
@@ -1330,9 +1318,7 @@ mod tests {
         let actual_ir = actual_ir.trim();
         assert!(
             expected_ir == actual_ir,
-            "Expected:\n{}\nGot:\n{}",
-            expected_ir,
-            actual_ir
+            "Expected:\n{expected_ir}\nGot:\n{actual_ir}"
         );
     }
 
@@ -1847,7 +1833,7 @@ block0:
 
         check(
             &func,
-            &format!("function %sample() -> i8 system_v {{{}\n}}\n", expected),
+            &format!("function %sample() -> i8 system_v {{{expected}\n}}\n"),
         );
     }
 

@@ -132,10 +132,7 @@ pub fn build_allowed_env_list<'a>(
         // Check that the configured names are valid ones.
         for c in configured {
             if !defaults.contains(&&c[start..]) {
-                panic!(
-                    "invalid environment configuration `{}`; must be one of: {:?}",
-                    c, defaults
-                );
+                panic!("invalid environment configuration `{c}`; must be one of: {defaults:?}");
             }
         }
 
@@ -160,6 +157,7 @@ pub fn parse_env_list(env_variable: &str) -> Option<Vec<String>> {
         .map(|l| l.split(",").map(|s| s.to_owned()).collect())
 }
 
+/// Smoke test an engine with a given config.
 #[cfg(test)]
 pub fn smoke_test_engine<T>(
     mk_engine: impl Fn(&mut arbitrary::Unstructured<'_>, &mut Config) -> arbitrary::Result<T>,
@@ -185,7 +183,7 @@ pub fn smoke_test_engine<T>(
         let mut engine = match mk_engine(&mut u, &mut config) {
             Ok(engine) => engine,
             Err(e) => {
-                println!("skip {:?}", e);
+                println!("skip {e:?}");
                 continue;
             }
         };

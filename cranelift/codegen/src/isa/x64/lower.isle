@@ -2,6 +2,8 @@
 
 ;; The main lowering constructor term: takes a clif `Inst` and returns the
 ;; register(s) within which the lowered instruction's result values live.
+(spec (lower arg)
+      (provide (= result arg)))
 (decl partial lower (Inst) InstOutput)
 
 ;; A variant of the main lowering constructor term, used for branches.
@@ -45,11 +47,6 @@
 (rule 1 (lower (f128const (u128_from_constant 0)))
       (xmm_zero $F128))
 
-;;;; Rules for `null` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-(rule (lower (has_type ty (null)))
-      (imm ty 0))
-
 ;;;; Rules for `iadd` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;; `i64` and smaller.
@@ -66,7 +63,7 @@
 ;; but the actual instruction emitted might be an `add` if it's equivalent.
 ;; For more details on this see the `emit.rs` logic to emit
 ;; `LoadEffectiveAddress`.
-(rule -5 (lower (has_type (ty_32_or_64 ty) (iadd x y)))
+(rule iadd_base_case_32_or_64_lea -5 (lower (has_type (ty_32_or_64 ty) (iadd x y)))
       (x64_lea ty (to_amode_add (mem_flags_trusted) x y (zero_offset))))
 
 ;; Higher-priority cases than the previous two where a load can be sunk into
@@ -101,15 +98,27 @@
 (rule 1 (lower (has_type $I128 (iadd x y)))
       ;; Get the high/low registers for `x`.
       (let ((x_regs ValueRegs x)
-            (x_lo Gpr (value_regs_get_gpr x_regs 0))
-            (x_hi Gpr (value_regs_get_gpr x_regs 1)))
-        ;; Get the high/low registers for `y`.
-        (let ((y_regs ValueRegs y)
-              (y_lo Gpr (value_regs_get_gpr y_regs 0))
-              (y_hi Gpr (value_regs_get_gpr y_regs 1)))
-          ;; Do an add followed by an add-with-carry.
-          (with_flags (x64_add_with_flags_paired $I64 x_lo y_lo)
-                      (x64_adc_paired $I64 x_hi y_hi)))))
+            (y_regs ValueRegs y))
+        (iadd128
+          (value_regs_get_gpr x_regs 0)
+          (value_regs_get_gpr x_regs 1)
+          (value_regs_get_gpr y_regs 0)
+          (value_regs_get_gpr y_regs 1))))
+(rule 2 (lower (has_type $I128 (iadd x (iconcat y_lo y_hi))))
+        (let ((x_regs ValueRegs x))
+          (iadd128 (value_regs_get_gpr x 0) (value_regs_get_gpr x 1) y_lo y_hi)))
+(rule 3 (lower (has_type $I128 (iadd x (uextend y @ (value_type $I64)))))
+        (let ((x_regs ValueRegs x))
+          (iadd128 (value_regs_get_gpr x 0) (value_regs_get_gpr x 1)
+                   y (RegMemImm.Imm 0))))
+
+;; Helper for lowering 128-bit addition with the 64-bit halves of the lhs/rhs
+;; already split. The first two arguments are lo/hi for the lhs and the second
+;; two are lo/hi for the rhs.
+(decl iadd128 (Gpr Gpr GprMemImm GprMemImm) ValueRegs)
+(rule (iadd128 x_lo x_hi y_lo y_hi)
+      (with_flags (x64_add_with_flags_paired $I64 x_lo y_lo)
+                  (x64_adc_paired $I64 x_hi y_hi)))
 
 ;;;; Helpers for `*_overflow` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -245,15 +254,27 @@
 (rule 1 (lower (has_type $I128 (isub x y)))
       ;; Get the high/low registers for `x`.
       (let ((x_regs ValueRegs x)
-            (x_lo Gpr (value_regs_get_gpr x_regs 0))
-            (x_hi Gpr (value_regs_get_gpr x_regs 1)))
-        ;; Get the high/low registers for `y`.
-        (let ((y_regs ValueRegs y)
-              (y_lo Gpr (value_regs_get_gpr y_regs 0))
-              (y_hi Gpr (value_regs_get_gpr y_regs 1)))
-          ;; Do a sub followed by an sub-with-borrow.
-          (with_flags (x64_sub_with_flags_paired $I64 x_lo y_lo)
-                      (x64_sbb_paired $I64 x_hi y_hi)))))
+            (y_regs ValueRegs y))
+        (isub128
+          (value_regs_get_gpr x_regs 0)
+          (value_regs_get_gpr x_regs 1)
+          (value_regs_get_gpr y_regs 0)
+          (value_regs_get_gpr y_regs 1))))
+(rule 2 (lower (has_type $I128 (isub x (iconcat y_lo y_hi))))
+        (let ((x_regs ValueRegs x))
+          (isub128 (value_regs_get_gpr x 0) (value_regs_get_gpr x 1) y_lo y_hi)))
+(rule 3 (lower (has_type $I128 (isub x (uextend y @ (value_type $I64)))))
+        (let ((x_regs ValueRegs x))
+          (isub128 (value_regs_get_gpr x 0) (value_regs_get_gpr x 1)
+                   y (RegMemImm.Imm 0))))
+
+;; Helper for lowering 128-bit subtraction with the 64-bit halves of the lhs/rhs
+;; already split. The first two arguments are lo/hi for the lhs and the second
+;; two are lo/hi for the rhs.
+(decl isub128 (Gpr Gpr GprMemImm GprMemImm) ValueRegs)
+(rule (isub128 x_lo x_hi y_lo y_hi)
+      (with_flags (x64_sub_with_flags_paired $I64 x_lo y_lo)
+                  (x64_sbb_paired $I64 x_hi y_hi)))
 
 ;;;; Rules for `ssub_sat` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -982,23 +1003,47 @@
 
 ;; 8-bit base case, needs a special instruction encoding and additionally
 ;; move sinkable loads to the right.
-(rule -7 (lower (has_type $I8 (imul x y))) (x64_mul8 $false x y))
-(rule -6 (lower (has_type $I8 (imul (sinkable_load x) y))) (x64_mul8 $false y x))
+(rule -8 (lower (has_type $I8 (imul x y))) (x64_mul8 $false x y))
+(rule -7 (lower (has_type $I8 (imul (sinkable_load x) y))) (x64_mul8 $false y x))
 
 ;; 16-to-64-bit base cases, same as above by moving sinkable loads to the right.
-(rule -5 (lower (has_type (ty_int_ref_16_to_64 ty) (imul x y)))
+(rule -6 (lower (has_type (ty_int_ref_16_to_64 ty) (imul x y)))
          (x64_imul ty x y))
-(rule -4 (lower (has_type (ty_int_ref_16_to_64 ty) (imul (sinkable_load x) y)))
+(rule -5 (lower (has_type (ty_int_ref_16_to_64 ty) (imul (sinkable_load x) y)))
          (x64_imul ty y x))
 
 ;; lift out constants to use 3-operand form
-(rule -3 (lower (has_type (ty_int_ref_16_to_64 ty) (imul x (i32_from_iconst y))))
+(rule -4 (lower (has_type (ty_int_ref_16_to_64 ty) (imul x (i32_from_iconst y))))
          (x64_imul_imm ty x y))
-(rule -2 (lower (has_type (ty_int_ref_16_to_64 ty) (imul (i32_from_iconst x) y)))
+(rule -3 (lower (has_type (ty_int_ref_16_to_64 ty) (imul (i32_from_iconst x) y)))
          (x64_imul_imm ty y x))
+
+;; Special case widening multiplication from 8-to-16-bits with a single
+;; instruction since the 8-bit-multiply places both the high and low halves in
+;; the same register
+(rule -2 (lower (has_type $I16 (imul (sextend x) (sextend y))))
+  (x64_mul8 $true x y))
+(rule -2 (lower (has_type $I16 (imul (uextend x) (uextend y))))
+  (x64_mul8 $false x y))
 
 ;; `i128`.
 
+(rule 2 (lower (has_type $I128 (imul x y)))
+      (let ((x_regs ValueRegs x)
+            (y_regs ValueRegs y))
+        (imul128
+          (value_regs_get_gpr x_regs 0)
+          (value_regs_get_gpr x_regs 1)
+          (value_regs_get_gpr y_regs 0)
+          (value_regs_get_gpr y_regs 1))))
+
+(rule 4 (lower (has_type $I128 (imul (iconcat x_lo x_hi) (iconcat y_lo y_hi))))
+        (imul128 x_lo x_hi y_lo y_hi))
+
+;; Helper for lowering 128-bit multiplication with the 64-bit halves of the
+;; lhs/rhs already split. The first two arguments are lo/hi for the lhs and the
+;; second two are lo/hi for the rhs.
+;;
 ;; mul:
 ;;   dst_lo = lhs_lo * rhs_lo
 ;;   dst_hi = umulhi(lhs_lo, rhs_lo) +
@@ -1012,16 +1057,10 @@
 ;;   dst_lo:hi_lolo = mulhi_u x_lo, y_lo
 ;;   dst_hi = add hilo_hilo, hi_lolo
 ;;   return (dst_lo, dst_hi)
-(rule 2 (lower (has_type $I128 (imul x y)))
+(decl imul128 (Gpr Gpr GprMem GprMem) ValueRegs)
+(rule (imul128 x_lo x_hi y_lo y_hi)
       ;; Put `x` into registers and unpack its hi/lo halves.
-      (let ((x_regs ValueRegs x)
-            (x_lo Gpr (value_regs_get_gpr x_regs 0))
-            (x_hi Gpr (value_regs_get_gpr x_regs 1))
-            ;; Put `y` into registers and unpack its hi/lo halves.
-            (y_regs ValueRegs y)
-            (y_lo Gpr (value_regs_get_gpr y_regs 0))
-            (y_hi Gpr (value_regs_get_gpr y_regs 1))
-            ;; lo_hi = mul x_lo, y_hi
+      (let (;; lo_hi = mul x_lo, y_hi
             (lo_hi Gpr (x64_imul $I64 x_lo y_hi))
             ;; hi_lo = mul x_hi, y_lo
             (hi_lo Gpr (x64_imul $I64 x_hi y_lo))
@@ -1034,6 +1073,17 @@
             ;; dst_hi = add hilo_hilo, hi_lolo
             (dst_hi Gpr (x64_add $I64 hilo_hilo hi_lolo)))
         (value_gprs dst_lo dst_hi)))
+
+;; The `mul` and `imul` instructions on x64 are defined as taking 64-bit
+;; operands and producing a 128-bit result, which exactly matches the semantics
+;; of widening 64-bit inputs to 128-bit and then multiplying them. That means
+;; that these cases can get some some simpler codegen.
+(rule 5 (lower (has_type $I128 (imul (uextend x @ (value_type $I64))
+                                     (uextend y @ (value_type $I64)))))
+        (x64_mul $I64 $false x y))
+(rule 5 (lower (has_type $I128 (imul (sextend x @ (value_type $I64))
+                                     (sextend y @ (value_type $I64)))))
+        (x64_mul $I64 $true x y))
 
 ;; SSE.
 
@@ -1812,6 +1862,15 @@
 (rule (lower (trap code))
       (side_effect (x64_ud2 code)))
 
+;;;; Rules for `trapz` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+(rule (lower (trapz val code))
+      (side_effect (trap_if_val (ZeroCond.Zero) val code)))
+
+;;;; Rules for `trapnz` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(rule (lower (trapnz val code))
+      (side_effect (trap_if_val (ZeroCond.NonZero) val code)))
+
 ;;;; Rules for `uadd_overflow_trap` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (rule (lower (has_type (fits_in_64 ty) (uadd_overflow_trap a b tc)))
@@ -2457,23 +2516,6 @@
        (x64_bswap $I64 (value_regs_get_gpr src 1))
        (x64_bswap $I64 (value_regs_get_gpr src 0))))
 
-;; Rules for `is_null` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-;; Null references are represented by the constant value `0`.
-(rule (lower (is_null src @ (value_type $R64)))
-      (with_flags
-       (x64_cmp_imm (OperandSize.Size64) src 0)
-       (x64_setcc (CC.Z))))
-
-;; Rules for `is_invalid` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-;; Invalid references are represented by the constant value `-1`.
-(rule (lower (is_invalid src @ (value_type $R64)))
-      (with_flags
-       (x64_cmp_imm (OperandSize.Size64) src 0xffffffff)  ;; simm32 0xffff_ffff is sign-extended to -1.
-       (x64_setcc (CC.Z))))
-
-
 ;; Rules for `uextend` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;; I{8,16,32,64} -> I128.
@@ -2649,7 +2691,9 @@
       ;; above that we have to handle properly. (Conversely, if they
       ;; don't differ, then the native instruction's answer is the
       ;; right one per CLIF semantics.)
-      (let ((min1 Xmm (x64_minps x y))
+      (let ((x Xmm x) ;; force x/y into registers and disallow load sinking
+            (y Xmm y)
+            (min1 Xmm (x64_minps x y))
             (min2 Xmm (x64_minps y x))
             ;; Compute the OR of the two. Note that NaNs have an
             ;; exponent field of all-ones (0xFF for F32), so if either
@@ -2687,7 +2731,9 @@
 ;; Likewise for F64 lanes, except that the right-shift is by 13 bits
 ;; (1 sign, 11 exponent, 1 QNaN bit).
 (rule (lower (has_type $F64X2 (fmin x y)))
-      (let ((min1 Xmm (x64_minpd x y))
+      (let ((x Xmm x) ;; force x/y into registers and disallow load sinking
+            (y Xmm y)
+            (min1 Xmm (x64_minpd x y))
             (min2 Xmm (x64_minpd y x))
             (min_or Xmm (x64_orpd min1 min2))
             (is_nan_mask Xmm (x64_cmppd min1 min2 (FcmpImm.Unordered)))
@@ -2712,7 +2758,9 @@
       ;; above that we have to handle properly. (Conversely, if they
       ;; don't differ, then the native instruction's answer is the
       ;; right one per CLIF semantics.)
-      (let ((max1 Xmm (x64_maxps x y))
+      (let ((x Xmm x) ;; force x/y into registers and disallow load sinking
+            (y Xmm y)
+            (max1 Xmm (x64_maxps x y))
             (max2 Xmm (x64_maxps y x))
             ;; Compute the XOR of the two maxima. In the case
             ;; where we don't have a +/-0 mismatch or NaNs, then
@@ -2755,7 +2803,9 @@
       ;; above that we have to handle properly. (Conversely, if they
       ;; don't differ, then the native instruction's answer is the
       ;; right one per CLIF semantics.)
-      (let ((max1 Xmm (x64_maxpd x y))
+      (let ((x Xmm x) ;; force x/y into registers and disallow load sinking
+            (y Xmm y)
+            (max1 Xmm (x64_maxpd x y))
             (max2 Xmm (x64_maxpd y x))
             ;; Compute the XOR of the two maxima. In the case
             ;; where we don't have a +/-0 mismatch or NaNs, then
@@ -2913,11 +2963,11 @@
 ;; 8-bit loads.
 ;;
 ;; By default, we zero-extend all sub-64-bit loads to a GPR.
-(rule -4 (lower (has_type (and (fits_in_32 ty) (is_gpr_type _)) (load flags address offset)))
+(rule load_sub64_x64_movzx -4 (lower (has_type (and (fits_in_32 ty) (is_gpr_type _)) (load flags address offset)))
       (x64_movzx (ext_mode (ty_bits_u16 ty) 64) (to_amode flags address offset)))
 ;; But if we know that both the `from` and `to` are 64 bits, we simply load with
 ;; no extension.
-(rule -1 (lower (has_type (ty_int_ref_64 ty) (load flags address offset)))
+(rule load_64_x64_movzx -1 (lower (has_type (ty_int_ref_64 ty) (load flags address offset)))
       (x64_mov (to_amode flags address offset)))
 ;; Also, certain scalar loads have a specific `from` width and extension kind
 ;; (signed -> `sx`, zeroed -> `zx`). We overwrite the high bits of the 64-bit
@@ -3000,7 +3050,7 @@
 ;; Rules for `store*` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;; 8-, 16-, 32- and 64-bit GPR stores.
-(rule -2 (lower (store flags
+(rule store_x64_movrm -2 (lower (store flags
                     value @ (value_type (is_gpr_type ty))
                     address
                     offset))
@@ -3152,7 +3202,7 @@
 ;; Rules for `load*` + ALU op + `store*` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;; Add mem, reg
-(rule 3 (lower
+(rule store_x64_add_mem 3 (lower
        (store flags
               (has_type (ty_32_or_64 ty)
                         (iadd (and
@@ -3355,6 +3405,16 @@
 
 (rule (lower (return_call_indirect sig_ref callee args))
       (gen_return_call_indirect sig_ref callee args))
+
+;; Rules for `stack_switch` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; currently, only the Basic model is supported
+(rule (lower (stack_switch store_context_ptr load_context_ptr in_payload0))
+      (if-let (StackSwitchModel.Basic) (stack_switch_model))
+      (let ((store_context_ptr Gpr (put_in_gpr store_context_ptr))
+            (load_context_ptr Gpr (put_in_gpr load_context_ptr))
+            (in_payload0 Gpr (put_in_gpr in_payload0)))
+        (x64_stack_switch_basic store_context_ptr load_context_ptr in_payload0)))
 
 ;;;; Rules for `get_{frame,stack}_pointer` and `get_return_address` ;;;;;;;;;;;;
 
@@ -3727,7 +3787,7 @@
             (tmp1 Xmm (x64_subps tmp1 tmp2))
 
             ;; Create mask for all positive lanes to saturate (i.e. greater than
-            ;; or equal to the maxmimum allowable unsigned int).
+            ;; or equal to the maximum allowable unsigned int).
             (tmp2 Xmm (x64_cmpps tmp2 tmp1 (FcmpImm.LessThanOrEqual)))
 
             ;; Convert those set of lanes that have the max_signed_int factored out.
@@ -4071,20 +4131,6 @@
                          (bitcast _ x @ (value_type (is_gpr_type _)))))
       x)
 
-;; Bitcasts between `r{32,64}` and `i{32,64}` need to be a copy to avoid
-;; conflicting regalloc constraints on reference type values that both need to
-;; be in some register but also some safepoint stack slot at the same time.
-(rule 2 (lower (has_type (is_gpr_type dst_ty)
-                         (bitcast _ x @ (value_type (is_gpr_type src_ty)))))
-      (if-let $true (is_ref_type src_ty))
-      (if-let $false (is_ref_type dst_ty))
-      (copy_gpr dst_ty x))
-(rule 2 (lower (has_type (is_gpr_type dst_ty)
-                         (bitcast _ x @ (value_type (is_gpr_type src_ty)))))
-      (if-let $false (is_ref_type src_ty))
-      (if-let $true (is_ref_type dst_ty))
-      (copy_gpr dst_ty x))
-
 ;; Bitcast between types residing in XMM registers is a no-op.
 (rule 3 (lower (has_type (is_xmm_type _)
                          (bitcast _ x @ (value_type (is_xmm_type _)))))
@@ -4196,7 +4242,7 @@
         (x64_div8 (extend_to_gpr a $I32 (ExtendKind.Zero))
                   (put_in_gpr b)
                   (DivSignedness.Unsigned)
-                  (TrapCode.IntegerDivisionByZero)))
+                  (TrapCode.INTEGER_DIVISION_BY_ZERO)))
 
 ;; 16-to-64-bit division is all done with a similar instruction and the only
 ;; tricky requirement here is that when div traps are disallowed the divisor
@@ -4207,7 +4253,7 @@
                           (put_in_gpr b)
                           (raw_operand_size_of_type ty)
                           (DivSignedness.Unsigned)
-                          (TrapCode.IntegerDivisionByZero)))
+                          (TrapCode.INTEGER_DIVISION_BY_ZERO)))
 
 ;; Rules for `sdiv` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -4215,7 +4261,7 @@
         (x64_div8 (x64_sign_extend_data a (OperandSize.Size8))
                   (nonzero_sdiv_divisor $I8 b)
                   (DivSignedness.Signed)
-                  (TrapCode.IntegerOverflow)))
+                  (TrapCode.INTEGER_OVERFLOW)))
 
 (rule 1 (lower (sdiv a @ (value_type (fits_in_64 ty)) b))
         (let (
@@ -4227,7 +4273,7 @@
                           (nonzero_sdiv_divisor ty b)
                           size
                           (DivSignedness.Signed)
-                          (TrapCode.IntegerOverflow))))
+                          (TrapCode.INTEGER_OVERFLOW))))
 
 ;; Checks to make sure that the input `Value` is a non-zero value for `sdiv`.
 ;;
@@ -4242,7 +4288,7 @@
           (val Reg val)
           (_ InstOutput (side_effect (with_flags_side_effect
             (x64_test (raw_operand_size_of_type ty) val val)
-            (trap_if (CC.Z) (TrapCode.IntegerDivisionByZero)))))
+            (trap_if (CC.Z) (TrapCode.INTEGER_DIVISION_BY_ZERO)))))
         )
         val))
 
@@ -4255,7 +4301,7 @@
             (result Gpr (x64_div8 (extend_to_gpr a $I32 (ExtendKind.Zero))
                                   (put_in_gpr b) ;; see `udiv` for why not `gpr_mem`
                                   (DivSignedness.Unsigned)
-                                  (TrapCode.IntegerDivisionByZero)))
+                                  (TrapCode.INTEGER_DIVISION_BY_ZERO)))
           )
           (x64_shr $I64 result (Imm8Reg.Imm8 8))))
 
@@ -4265,7 +4311,7 @@
                            (put_in_gpr b) ;; see `udiv` for why not `gpr_mem`
                            (raw_operand_size_of_type ty)
                            (DivSignedness.Unsigned)
-                           (TrapCode.IntegerDivisionByZero)))
+                           (TrapCode.INTEGER_DIVISION_BY_ZERO)))
 
 ;; Rules for `srem` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -4278,7 +4324,7 @@
         (if-let n (safe_divisor_from_imm64 $I8 imm))
         (let (
             (a Gpr (x64_sign_extend_data a (OperandSize.Size8)))
-            (result Gpr (x64_div8 a (imm $I8 n) (DivSignedness.Signed) (TrapCode.IntegerDivisionByZero)))
+            (result Gpr (x64_div8 a (imm $I8 n) (DivSignedness.Signed) (TrapCode.INTEGER_DIVISION_BY_ZERO)))
           )
           (x64_shr $I64 result (Imm8Reg.Imm8 8))))
 
@@ -4294,7 +4340,7 @@
                              (imm ty n)
                              size
                              (DivSignedness.Signed)
-                             (TrapCode.IntegerDivisionByZero))))
+                             (TrapCode.INTEGER_DIVISION_BY_ZERO))))
 
 (rule 1 (lower (srem a @ (value_type $I8) b))
         (let (
@@ -4318,6 +4364,14 @@
 
 (rule 1 (lower (umulhi a @ (value_type (ty_int_ref_16_to_64 ty)) b))
         (value_regs_get_gpr (x64_mul ty $false a b) 1))
+
+;; The BMI2 instruction set introduced `mulx` which defines two registers but
+;; if the two registers are the same then it only defines the upper bits. This
+;; helps slightly reduce register pressure by ensuring only one register here is
+;; clobbered.
+(rule 2 (lower (umulhi a @ (value_type (ty_32_or_64 ty)) b))
+        (if-let $true (use_bmi2))
+        (x64_mulx_hi ty a b))
 
 ;; Rules for `smulhi` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 

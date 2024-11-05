@@ -1,12 +1,11 @@
 //! Data structures for representing decoded wasm modules.
 
 use crate::prelude::*;
-use crate::{PrimaryMap, Tunables};
+use crate::*;
 use alloc::collections::BTreeMap;
 use core::ops::Range;
 use cranelift_entity::{packed_option::ReservedValue, EntityRef};
 use serde_derive::{Deserialize, Serialize};
-use wasmtime_types::*;
 
 /// Implementation styles for WebAssembly linear memory.
 #[derive(Debug, Clone, Hash, Serialize, Deserialize)]
@@ -33,6 +32,7 @@ impl MemoryStyle {
             // page size, but unfortunately that is a little hard to plumb
             // through here.
             memory.page_size_log2 >= Memory::DEFAULT_PAGE_SIZE_LOG2
+            && tunables.signals_based_traps
             && match memory.maximum_byte_size() {
                 Ok(mut maximum) => {
                     if tunables.static_memory_bound_is_maximum {
@@ -413,10 +413,10 @@ pub enum TableSegmentElements {
 
 impl TableSegmentElements {
     /// Returns the number of elements in this segment.
-    pub fn len(&self) -> u32 {
+    pub fn len(&self) -> u64 {
         match self {
-            Self::Functions(s) => s.len() as u32,
-            Self::Expressions(s) => s.len() as u32,
+            Self::Functions(s) => u64::try_from(s.len()).unwrap(),
+            Self::Expressions(s) => u64::try_from(s.len()).unwrap(),
         }
     }
 }

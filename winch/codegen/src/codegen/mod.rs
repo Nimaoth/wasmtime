@@ -1,7 +1,7 @@
 use crate::{
     abi::{scratch, vmctx, ABIOperand, ABISig, RetArea},
     codegen::BlockSig,
-    isa::reg::Reg,
+    isa::reg::{writable, Reg},
     masm::{
         ExtendKind, IntCmpKind, MacroAssembler, OperandSize, RegImm, SPOffset, ShiftKind, TrapCode,
     },
@@ -21,6 +21,7 @@ use cranelift_codegen::{
     binemit::CodeOffset,
     ir::{RelSourceLoc, SourceLoc},
 };
+use wasmtime_cranelift::{TRAP_BAD_SIGNATURE, TRAP_TABLE_OUT_OF_BOUNDS};
 
 mod context;
 pub(crate) use context::*;
@@ -134,8 +135,11 @@ where
         // We need to use the vmctx parameter before pinning it for stack checking.
         self.masm.prologue(vmctx);
         // Pin the `VMContext` pointer.
-        self.masm
-            .mov(vmctx.into(), vmctx!(M), self.env.ptr_type().into());
+        self.masm.mov(
+            writable!(vmctx!(M)),
+            vmctx.into(),
+            self.env.ptr_type().into(),
+        );
 
         self.masm.reserve_stack(self.context.frame.locals_size);
 
@@ -242,7 +246,7 @@ where
         struct ValidateThenVisit<'a, T, U>(T, &'a mut U, usize);
 
         macro_rules! validate_then_visit {
-            ($( @$proposal:ident $op:ident $({ $($arg:ident: $argty:ty),* })? => $visit:ident)*) => {
+            ($( @$proposal:ident $op:ident $({ $($arg:ident: $argty:ty),* })? => $visit:ident $ann:tt)*) => {
                 $(
                     fn $visit(&mut self $($(,$arg: $argty)*)?) -> Self::Output {
                         self.0.$visit($($($arg.clone()),*)?)?;
@@ -344,7 +348,7 @@ where
         // Load the signatures address into the scratch register.
         self.masm.load(
             self.masm.address_at_vmctx(signatures_base_offset.into()),
-            scratch,
+            writable!(scratch),
             ptr_size,
         );
 
@@ -352,7 +356,7 @@ where
         let caller_id = self.context.any_gpr(self.masm);
         self.masm.load(
             self.masm.address_at_reg(scratch, sig_offset),
-            caller_id,
+            writable!(caller_id),
             sig_size,
         );
 
@@ -360,13 +364,13 @@ where
         self.masm.load(
             self.masm
                 .address_at_reg(funcref_ptr, funcref_sig_offset.into()),
-            callee_id,
+            writable!(callee_id),
             sig_size,
         );
 
         // Typecheck.
         self.masm.cmp(caller_id, callee_id.into(), OperandSize::S32);
-        self.masm.trapif(IntCmpKind::Ne, TrapCode::BadSignature);
+        self.masm.trapif(IntCmpKind::Ne, TRAP_BAD_SIGNATURE);
         self.context.free_reg(callee_id);
         self.context.free_reg(caller_id);
     }
@@ -419,7 +423,9 @@ where
                 match &ty {
                     I32 | I64 | F32 | F64 | V128 => self.masm.store(src.into(), addr, ty.into()),
                     Ref(rt) => match rt.heap_type {
-                        WasmHeapType::Func => self.masm.store_ptr(src.into(), addr),
+                        WasmHeapType::Func | WasmHeapType::Extern => {
+                            self.masm.store_ptr(src.into(), addr)
+                        }
                         ht => unimplemented!("Support for WasmHeapType: {ht}"),
                     },
                 }
@@ -452,7 +458,7 @@ where
         let addr = if data.imported {
             let global_base = self.masm.address_at_reg(vmctx!(M), data.offset);
             let scratch = scratch!(M);
-            self.masm.load_ptr(global_base, scratch);
+            self.masm.load_ptr(global_base, writable!(scratch));
             self.masm.address_at_reg(scratch, 0)
         } else {
             self.masm.address_at_reg(vmctx!(M), data.offset)
@@ -486,7 +492,7 @@ where
         let base = self.context.any_gpr(self.masm);
 
         let elem_addr = self.emit_compute_table_elem_addr(index.into(), base, &table_data);
-        self.masm.load_ptr(elem_addr, elem_value);
+        self.masm.load_ptr(elem_addr, writable!(elem_value));
         // Free the register used as base, once we have loaded the element
         // address into the element value register.
         self.context.free_reg(base);
@@ -529,7 +535,7 @@ where
         self.masm.bind(defined);
         let imm = RegImm::i64(FUNCREF_MASK as i64);
         let dst = top.into();
-        self.masm.and(dst, dst, imm, top.ty.into());
+        self.masm.and(writable!(dst), dst, imm, top.ty.into());
 
         self.masm.bind(cont);
     }
@@ -545,7 +551,7 @@ where
     ///
     /// Winch follows almost the same principles as Cranelift when it comes to
     /// bounds checks, for a more detailed explanation refer to
-    /// [cranelift_wasm::code_translator::prepare_addr].
+    /// prepare_addr in wasmtime-cranelift.
     ///
     /// Winch implementation differs in that, it defaults to the general case
     /// for dynamic heaps rather than optimizing for doing the least amount of
@@ -593,20 +599,35 @@ where
                 // Move the value of the index to the
                 // index_offset_and_access_size register to perform the overflow
                 // check to avoid clobbering the initial index value.
+                //
+                // We derive size of the operation from the heap type since:
+                //
+                // * This is the first assignment to the
+                // `index_offset_and_access_size` register
+                //
+                // * The memory64 proposal specifies that the index is bound to
+                // the heap type instead of hardcoding it to 32-bits (i32).
                 self.masm.mov(
+                    writable!(index_offset_and_access_size),
                     index_reg.into(),
-                    index_offset_and_access_size,
                     heap.ty.into(),
                 );
                 // Perform
                 // index = index + offset + access_size, trapping if the
                 // addition overflows.
+                //
+                // We use the target's pointer size rather than depending on the heap
+                // type since we want to check for overflow; even though the
+                // offset and access size are guaranteed to be bounded by the heap
+                // type, when added, if used with the wrong operand size, their
+                // result could be clamped, resulting in an erroneus overflow
+                // check.
                 self.masm.checked_uadd(
-                    index_offset_and_access_size,
+                    writable!(index_offset_and_access_size),
                     index_offset_and_access_size,
                     RegImm::i64(offset_with_access_size as i64),
-                    heap.ty.into(),
-                    TrapCode::HeapOutOfBounds,
+                    ptr_size,
+                    TrapCode::HEAP_OUT_OF_BOUNDS,
                 );
 
                 let addr = bounds::load_heap_addr_checked(
@@ -623,7 +644,10 @@ where
                         masm.cmp(
                             index_offset_and_access_size.into(),
                             bounds_reg.into(),
-                            heap.ty.into(),
+                            // We use the pointer size to keep the bounds
+                            // comparison consistent with the result of the
+                            // overflow check above.
+                            ptr_size,
                         );
                         IntCmpKind::GtU
                     },
@@ -641,7 +665,7 @@ where
             // reachability is restored or when reaching the end of the
             // function.
             HeapStyle::Static { bound } if offset_with_access_size > bound => {
-                self.masm.trap(TrapCode::HeapOutOfBounds);
+                self.masm.trap(TrapCode::HEAP_OUT_OF_BOUNDS);
                 self.context.reachable = false;
                 None
             }
@@ -707,7 +731,12 @@ where
                         masm.cmp(
                             index_reg,
                             RegImm::i64(adjusted_bounds as i64),
-                            heap.ty.into(),
+                            // Similar to the dynamic heap case, even though the
+                            // offset and access size are bound through the heap
+                            // type, when added they can overflow, resulting in
+                            // an erroneus comparison, therfore we rely on the
+                            // target pointer size.
+                            ptr_size,
                         );
                         IntCmpKind::GtU
                     },
@@ -737,7 +766,7 @@ where
             };
 
             let src = self.masm.address_at_reg(addr, 0);
-            self.masm.wasm_load(src, dst, size, sextend);
+            self.masm.wasm_load(src, writable!(dst), size, sextend);
             self.context.stack.push(TypedReg::new(ty, dst).into());
             self.context.free_reg(addr);
         }
@@ -772,11 +801,12 @@ where
             // If the table data declares a particular offset base,
             // load the address into a register to further use it as
             // the table address.
-            self.masm.load_ptr(self.masm.address_at_vmctx(offset), base);
+            self.masm
+                .load_ptr(self.masm.address_at_vmctx(offset), writable!(base));
         } else {
             // Else, simply move the vmctx register into the addr register as
             // the base to calculate the table address.
-            self.masm.mov(vmctx!(M).into(), base, ptr_size);
+            self.masm.mov(writable!(base), vmctx!(M).into(), ptr_size);
         };
 
         // OOB check.
@@ -784,34 +814,38 @@ where
             .masm
             .address_at_reg(base, table_data.current_elems_offset);
         let bound_size = table_data.current_elements_size;
-        self.masm.load(bound_addr, bound, bound_size.into());
-        self.masm.cmp(index, bound.into(), bound_size);
         self.masm
-            .trapif(IntCmpKind::GeU, TrapCode::TableOutOfBounds);
+            .load(bound_addr, writable!(bound), bound_size.into());
+        self.masm.cmp(index, bound.into(), bound_size);
+        self.masm.trapif(IntCmpKind::GeU, TRAP_TABLE_OUT_OF_BOUNDS);
 
         // Move the index into the scratch register to calculate the table
         // element address.
         // Moving the value of the index register to the scratch register
         // also avoids overwriting the context of the index register.
-        self.masm.mov(index.into(), scratch, bound_size);
+        self.masm.mov(writable!(scratch), index.into(), bound_size);
         self.masm.mul(
-            scratch,
+            writable!(scratch),
             scratch,
             RegImm::i32(table_data.element_size.bytes() as i32),
             table_data.element_size,
         );
-        self.masm
-            .load_ptr(self.masm.address_at_reg(base, table_data.offset), base);
+        self.masm.load_ptr(
+            self.masm.address_at_reg(base, table_data.offset),
+            writable!(base),
+        );
         // Copy the value of the table base into a temporary register
         // so that we can use it later in case of a misspeculation.
-        self.masm.mov(base.into(), tmp, ptr_size);
+        self.masm.mov(writable!(tmp), base.into(), ptr_size);
         // Calculate the address of the table element.
-        self.masm.add(base, base, scratch.into(), ptr_size);
+        self.masm
+            .add(writable!(base), base, scratch.into(), ptr_size);
         if self.env.table_access_spectre_mitigation() {
             // Perform a bounds check and override the value of the
             // table element address in case the index is out of bounds.
             self.masm.cmp(index, bound.into(), OperandSize::S32);
-            self.masm.cmov(tmp, base, IntCmpKind::GeU, ptr_size);
+            self.masm
+                .cmov(writable!(base), tmp, IntCmpKind::GeU, ptr_size);
         }
         self.context.free_reg(bound);
         self.context.free_reg(tmp);
@@ -826,16 +860,20 @@ where
 
         if let Some(offset) = table_data.import_from {
             self.masm
-                .load_ptr(self.masm.address_at_vmctx(offset), scratch);
+                .load_ptr(self.masm.address_at_vmctx(offset), writable!(scratch));
         } else {
-            self.masm.mov(vmctx!(M).into(), scratch, ptr_size);
+            self.masm
+                .mov(writable!(scratch), vmctx!(M).into(), ptr_size);
         };
 
         let size_addr = self
             .masm
             .address_at_reg(scratch, table_data.current_elems_offset);
-        self.masm
-            .load(size_addr, size, table_data.current_elements_size.into());
+        self.masm.load(
+            size_addr,
+            writable!(size),
+            table_data.current_elements_size.into(),
+        );
 
         self.context.stack.push(TypedReg::i32(size).into());
     }
@@ -847,7 +885,7 @@ where
 
         let base = if let Some(offset) = heap_data.import_from {
             self.masm
-                .load_ptr(self.masm.address_at_vmctx(offset), scratch);
+                .load_ptr(self.masm.address_at_vmctx(offset), writable!(scratch));
             scratch
         } else {
             vmctx!(M)
@@ -856,12 +894,12 @@ where
         let size_addr = self
             .masm
             .address_at_reg(base, heap_data.current_length_offset);
-        self.masm.load_ptr(size_addr, size_reg);
+        self.masm.load_ptr(size_addr, writable!(size_reg));
         // Emit a shift to get the size in pages rather than in bytes.
         let dst = TypedReg::new(heap_data.ty, size_reg);
         let pow = heap_data.page_size_log2;
         self.masm.shift_ir(
-            dst.reg,
+            writable!(dst.reg),
             pow as u64,
             dst.into(),
             ShiftKind::ShrU,
@@ -876,5 +914,5 @@ where
 pub fn control_index(depth: u32, control_length: usize) -> usize {
     (control_length - 1)
         .checked_sub(depth as usize)
-        .unwrap_or_else(|| panic!("expected valid control stack frame at index: {}", depth))
+        .unwrap_or_else(|| panic!("expected valid control stack frame at index: {depth}"))
 }

@@ -1,9 +1,10 @@
+use crate::hash_map::HashMap;
 use crate::prelude::*;
 use crate::{
     store::StoreOpaque, AsContextMut, FrameInfo, Global, HeapType, Instance, Memory, Module,
     StoreContextMut, Val, ValType, WasmBacktrace,
 };
-use std::{collections::HashMap, fmt};
+use std::fmt;
 
 /// Representation of a core dump of a WebAssembly module
 ///
@@ -137,16 +138,18 @@ impl WasmCoreDump {
                 // to balance these conflicting desires, we break the memory up
                 // into reasonably-sized chunks and then trim runs of zeroes
                 // from the start and end of each chunk.
-                const CHUNK_SIZE: u32 = 4096;
-                for (i, chunk) in mem
-                    .data(&store)
-                    .chunks_exact(CHUNK_SIZE as usize)
-                    .enumerate()
-                {
+                const CHUNK_SIZE: usize = 4096;
+                for (i, chunk) in mem.data(&store).chunks_exact(CHUNK_SIZE).enumerate() {
                     if let Some(start) = chunk.iter().position(|byte| *byte != 0) {
                         let end = chunk.iter().rposition(|byte| *byte != 0).unwrap() + 1;
-                        let offset = (i as u32) * CHUNK_SIZE + (start as u32);
-                        let offset = wasm_encoder::ConstExpr::i32_const(offset as i32);
+                        let offset = i * CHUNK_SIZE + start;
+                        let offset = if ty.is_64() {
+                            let offset = u64::try_from(offset).unwrap();
+                            wasm_encoder::ConstExpr::i64_const(offset as i64)
+                        } else {
+                            let offset = u32::try_from(offset).unwrap();
+                            wasm_encoder::ConstExpr::i32_const(offset as i32)
+                        };
                         data.active(memory_idx, &offset, chunk[start..end].iter().copied());
                     }
                 }
@@ -189,12 +192,8 @@ impl WasmCoreDump {
                 let init = match g.get(&mut store) {
                     Val::I32(x) => wasm_encoder::ConstExpr::i32_const(x),
                     Val::I64(x) => wasm_encoder::ConstExpr::i64_const(x),
-                    Val::F32(x) => {
-                        wasm_encoder::ConstExpr::f32_const(unsafe { std::mem::transmute(x) })
-                    }
-                    Val::F64(x) => {
-                        wasm_encoder::ConstExpr::f64_const(unsafe { std::mem::transmute(x) })
-                    }
+                    Val::F32(x) => wasm_encoder::ConstExpr::f32_const(f32::from_bits(x)),
+                    Val::F64(x) => wasm_encoder::ConstExpr::f64_const(f64::from_bits(x)),
                     Val::V128(x) => wasm_encoder::ConstExpr::v128_const(x.as_u128() as i128),
                     Val::FuncRef(_) => {
                         wasm_encoder::ConstExpr::ref_null(wasm_encoder::HeapType::FUNC)
@@ -312,17 +311,17 @@ impl fmt::Display for WasmCoreDump {
 
         writeln!(f, "instances:")?;
         for instance in self.instances.iter() {
-            writeln!(f, "  {:?}", instance)?;
+            writeln!(f, "  {instance:?}")?;
         }
 
         writeln!(f, "memories:")?;
         for memory in self.memories.iter() {
-            writeln!(f, "  {:?}", memory)?;
+            writeln!(f, "  {memory:?}")?;
         }
 
         writeln!(f, "globals:")?;
         for global in self.globals.iter() {
-            writeln!(f, "  {:?}", global)?;
+            writeln!(f, "  {global:?}")?;
         }
 
         writeln!(f, "backtrace:")?;

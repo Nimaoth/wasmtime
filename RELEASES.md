@@ -1,121 +1,102 @@
-## 24.0.1
+## 26.0.0
 
-Released 2024-10-09.
-
-### Fixed
-
-* Fix a runtime crash when combining tail-calls with host imports that capture a
-  stack trace or trap.
-  [GHSA-q8hx-mm92-4wvg](https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-q8hx-mm92-4wvg)
-
-* Fix a race condition could lead to WebAssembly control-flow integrity and type
-  safety violations.
-  [GHSA-7qmx-3fpx-r45m](https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-7qmx-3fpx-r45m)
-
---------------------------------------------------------------------------------
-
-## 24.0.0
-
-Released 2024-08-20.
+Released 2024-10-22.
 
 ### Added
 
-* A new `wasmtime_engine_clone` function was added to the C API.
-  [#8907](https://github.com/bytecodealliance/wasmtime/pull/8907)
+* The "table64" extension of the memory64 proposals to WebAssembly has been
+  implemented.
+  [#9206](https://github.com/bytecodealliance/wasmtime/pull/9206)
 
-* Wasmtime now has basic support for allocating a `StructRef` in the embedder
-  API.
-  [#8933](https://github.com/bytecodealliance/wasmtime/pull/8933)
+* Initial support has been added for compiling WebAssembly modules with Pulley,
+  Wasmtime's interpreter. Note that the interpreter is not feature complete yet.
+  [#9240](https://github.com/bytecodealliance/wasmtime/pull/9240)
 
-* The `wasmtime run` subcommand now support a `--argv0` flag indicating the
-  value of the first element to arguments reported to wasm if it shouldn't be
-  the default of the wasm binary name itself.
-  [#8961](https://github.com/bytecodealliance/wasmtime/pull/8961)
+* Wasmtime can now execute code without relying on host-based signal handlers.
+  [#9230](https://github.com/bytecodealliance/wasmtime/pull/9230)
 
-* Support for Winch on AArch64 continued to improve.
-  [#8921](https://github.com/bytecodealliance/wasmtime/pull/8921)
-  [#9018](https://github.com/bytecodealliance/wasmtime/pull/9018)
-  [#9033](https://github.com/bytecodealliance/wasmtime/pull/9033)
-  [#9051](https://github.com/bytecodealliance/wasmtime/pull/9051)
+* Work has continued on implementing the GC proposals in Wasmtime.
+  [#9246](https://github.com/bytecodealliance/wasmtime/pull/9246)
+  [#9244](https://github.com/bytecodealliance/wasmtime/pull/9244)
+  [#9271](https://github.com/bytecodealliance/wasmtime/pull/9271)
+  [#9275](https://github.com/bytecodealliance/wasmtime/pull/9275)
+  [#9278](https://github.com/bytecodealliance/wasmtime/pull/9278)
+  [#9282](https://github.com/bytecodealliance/wasmtime/pull/9282)
+  [#9285](https://github.com/bytecodealliance/wasmtime/pull/9285)
+  [#9326](https://github.com/bytecodealliance/wasmtime/pull/9326)
+  [#9341](https://github.com/bytecodealliance/wasmtime/pull/9341)
+  [#9358](https://github.com/bytecodealliance/wasmtime/pull/9358)
 
-* An initial implementation of the `wasi-runtime-config` proposal was added to
-  Wasmtime.
-  [#8950](https://github.com/bytecodealliance/wasmtime/pull/8950)
-  [#8970](https://github.com/bytecodealliance/wasmtime/pull/8970)
-  [#8981](https://github.com/bytecodealliance/wasmtime/pull/8981)
+* Support for ARM64 Windows has been finished with support for unwinding.
+  Release binaries are now also available for this platform.
+  [#9266](https://github.com/bytecodealliance/wasmtime/pull/9266)
+  [#9283](https://github.com/bytecodealliance/wasmtime/pull/9283)
 
-* Initial support for f16 and f128 in Cranelift continued to improve.
-  [#8893](https://github.com/bytecodealliance/wasmtime/pull/8893)
-  [#9045](https://github.com/bytecodealliance/wasmtime/pull/9045)
+* The `bindgen!` macro now supports multiple paths to load WIT from.
+  [#9288](https://github.com/bytecodealliance/wasmtime/pull/9288)
 
-* More types in `wasmtime-wasi-http` implement the `Debug` trait.
-  [#8979](https://github.com/bytecodealliance/wasmtime/pull/8979)
+* A new `-W async-stack-size=N` argument has been added to the CLI.
+  [#9302](https://github.com/bytecodealliance/wasmtime/pull/9302)
 
-* The `wasmtime explore` subcommand now supports exploring CLIF too.
-  [#8972](https://github.com/bytecodealliance/wasmtime/pull/8972)
+* A new `wasmtime completion` subcommand can be used to generate a completion
+  script for the Wasmtime CLI.
+  [#9312](https://github.com/bytecodealliance/wasmtime/pull/9312)
 
-* Support for SIMD in Winch has begun, but it is not complete yet.
-  [#8990](https://github.com/bytecodealliance/wasmtime/pull/8990)
-  [#9006](https://github.com/bytecodealliance/wasmtime/pull/9006)
+* Components now support `initialize_copy_on_write_image` like core modules.
+  [#9357](https://github.com/bytecodealliance/wasmtime/pull/9357)
 
-* Initial work on Pulley, an interpreter for Wasmtime, has begun.
-  [#9008](https://github.com/bytecodealliance/wasmtime/pull/9008)
-  [#9013](https://github.com/bytecodealliance/wasmtime/pull/9013)
-  [#9014](https://github.com/bytecodealliance/wasmtime/pull/9014)
-
-* The `-Wunknown-imports-trap` flag to `wasmtime run` now supports components.
-  [#9021](https://github.com/bytecodealliance/wasmtime/pull/9021)
-
-* An initial implementation of the `wasi-keyvalue` proposal was added to
-  Wasmtime.
-  [#8983](https://github.com/bytecodealliance/wasmtime/pull/8983)
-  [#9032](https://github.com/bytecodealliance/wasmtime/pull/9032)
-  [#9050](https://github.com/bytecodealliance/wasmtime/pull/9050)
-  [#9062](https://github.com/bytecodealliance/wasmtime/pull/9062)
-
-* An `unsafe` API has been added to unload process trap handlers.
-  [#9022](https://github.com/bytecodealliance/wasmtime/pull/9022)
-
-* The s390x backend now fully supports tail calls.
-  [#9052](https://github.com/bytecodealliance/wasmtime/pull/9052)
+* Initial support for the ISLE verifier Crocus has landed.
+  [#9178](https://github.com/bytecodealliance/wasmtime/pull/9178)
 
 ### Changed
 
-* The `flags` type in the component model now has a hard limit of 32-or-fewer
-  flags. For more information about this transition see
-  https://github.com/WebAssembly/component-model/issues/370.
-  [#8882](https://github.com/bytecodealliance/wasmtime/pull/8882)
+* Wasmtime now requires Rust 1.79.0 to compile.
+  [#9202](https://github.com/bytecodealliance/wasmtime/pull/9202)
 
-* Multiple returns for functions in the component model are now gated by default
-  and are planned to be removed.
-  [#8965](https://github.com/bytecodealliance/wasmtime/pull/8965)
+* The `future-trailers.get` in `wasi-http` now returns `none` when trailers are
+  absent.
+  [#9208](https://github.com/bytecodealliance/wasmtime/pull/9208)
 
-* TCP streams in WASIp2 will now immediately return `StreamError::Closed` when
-  the TCP stream is closed or shut down.
-  [#8968](https://github.com/bytecodealliance/wasmtime/pull/8968)
-  [#9055](https://github.com/bytecodealliance/wasmtime/pull/9055)
+* The Cranelift instructions `iadd_cin` and `isub_bin` were removed. The
+  `isub_borrow` and `iadd_carry` instructions were renamed to `{u,s}add_carry`
+  and `{u,s}sub_borrow`.
+  [#9199](https://github.com/bytecodealliance/wasmtime/pull/9199)
 
-* Cranelift will now perform constant propagation on some floating-point
-  operations.
-  [#8954](https://github.com/bytecodealliance/wasmtime/pull/8954)
+* Winch now supports multi-value results on AArch64.
+  [#9218](https://github.com/bytecodealliance/wasmtime/pull/9218)
 
-* Wasmtime and Cranelift now require at least Rust 1.78.0 to compile.
-  [#9010](https://github.com/bytecodealliance/wasmtime/pull/9010)
+* Some issues related to `shutdown` have been fixed with WASI sockets.
+  [#9225](https://github.com/bytecodealliance/wasmtime/pull/9225)
 
-* The `wasmtime::Val` type now implements the `Copy` trait.
-  [#9024](https://github.com/bytecodealliance/wasmtime/pull/9024)
+* Cranelift now has a Cargo feature to enable support for all native ISAs and
+  not Pulley.
+  [#9237](https://github.com/bytecodealliance/wasmtime/pull/9237)
 
-* Wasmtime's wasi-nn implementation has been updated to track the upstream
-  specification.
-  [#9056](https://github.com/bytecodealliance/wasmtime/pull/9056)
+* Cranelift support for `StructArgument` in the arm64, riscv64, and s390x
+  backends has been removed.
+  [#9258](https://github.com/bytecodealliance/wasmtime/pull/9258)
 
-* Names provided to `trappable_imports` in `bindgen!` are now validated to be
-  used.
-  [#9057](https://github.com/bytecodealliance/wasmtime/pull/9057)
+* The pooling allocator no longer limits instances/memories/tables by default.
+  [#9257](https://github.com/bytecodealliance/wasmtime/pull/9257)
 
-* Support for multi-package `*.wit` files now requires a `package ...;` header
-  at the top of the file.
-  [#9053](https://github.com/bytecodealliance/wasmtime/pull/9053)
+* Stack overflow on an async stack will now print a message that this happened.
+  [#9304](https://github.com/bytecodealliance/wasmtime/pull/9304)
+
+* Cranelift's `cranelift-wasm` crate has been removed and folded directly into
+  `wasmtime-cranelift`.
+  [#9313](https://github.com/bytecodealliance/wasmtime/pull/9313)
+
+* Cranelift's `TrapCode` type is now represented with a single byte.
+  [#9338](https://github.com/bytecodealliance/wasmtime/pull/9338)
+
+### Fixed
+
+* Stack slots in Cranelift are now aligned from the start instead of the end.
+  [#9279](https://github.com/bytecodealliance/wasmtime/pull/9279)
+
+* The WASIp1 adapter now correctly handles allocations where the initial
+  alignment consumes the entire allocation.
+  [#9356](https://github.com/bytecodealliance/wasmtime/pull/9356)
 
 --------------------------------------------------------------------------------
 
@@ -123,6 +104,8 @@ Release notes for previous releases of Wasmtime can be found on the respective
 release branches of the Wasmtime repository.
 
 <!-- ARCHIVE_START -->
+* [25.0.x](https://github.com/bytecodealliance/wasmtime/blob/release-25.0.0/RELEASES.md)
+* [24.0.x](https://github.com/bytecodealliance/wasmtime/blob/release-24.0.0/RELEASES.md)
 * [23.0.x](https://github.com/bytecodealliance/wasmtime/blob/release-23.0.0/RELEASES.md)
 * [22.0.x](https://github.com/bytecodealliance/wasmtime/blob/release-22.0.0/RELEASES.md)
 * [21.0.x](https://github.com/bytecodealliance/wasmtime/blob/release-21.0.0/RELEASES.md)

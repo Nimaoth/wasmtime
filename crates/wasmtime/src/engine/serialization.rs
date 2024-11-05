@@ -204,6 +204,7 @@ struct WasmFeatures {
     custom_page_sizes: bool,
     component_model_more_flags: bool,
     component_model_multiple_returns: bool,
+    gc_types: bool,
 }
 
 impl Metadata<'_> {
@@ -232,13 +233,15 @@ impl Metadata<'_> {
             component_model_more_flags,
             component_model_multiple_returns,
             legacy_exceptions,
+            gc_types,
+            stack_switching,
 
             // Always on; we don't currently have knobs for these.
             mutable_global: _,
             saturating_float_to_int: _,
             sign_extension: _,
             floats: _,
-        } = engine.config().features.inflate();
+        } = engine.features().inflate();
 
         // These features are not implemented in Wasmtime yet. We match on them
         // above so that once we do implement support for them, we won't
@@ -248,6 +251,7 @@ impl Metadata<'_> {
         assert!(!component_model_nested_names);
         assert!(!shared_everything_threads);
         assert!(!legacy_exceptions);
+        assert!(!stack_switching);
 
         Metadata {
             target: engine.compiler().triple().to_string(),
@@ -272,6 +276,7 @@ impl Metadata<'_> {
                 custom_page_sizes,
                 component_model_more_flags,
                 component_model_multiple_returns,
+                gc_types,
             },
         }
     }
@@ -281,7 +286,7 @@ impl Metadata<'_> {
         self.check_shared_flags(engine)?;
         self.check_isa_flags(engine)?;
         self.check_tunables(&engine.tunables())?;
-        self.check_features(&engine.config().features)?;
+        self.check_features(&engine.features())?;
         Ok(())
     }
 
@@ -367,7 +372,7 @@ impl Metadata<'_> {
             table_lazy_init,
             relaxed_simd_deterministic,
             winch_callable,
-
+            signals_based_traps,
             // This doesn't affect compilation, it's just a runtime setting.
             dynamic_memory_growth_reserve: _,
 
@@ -433,6 +438,11 @@ impl Metadata<'_> {
             other.winch_callable,
             "Winch calling convention",
         )?;
+        Self::check_bool(
+            signals_based_traps,
+            other.signals_based_traps,
+            "Signals-based traps",
+        )?;
 
         Ok(())
     }
@@ -477,31 +487,25 @@ impl Metadata<'_> {
             custom_page_sizes,
             component_model_more_flags,
             component_model_multiple_returns,
+            gc_types,
         } = self.features;
 
         use wasmparser::WasmFeatures as F;
-        Self::check_cfg_bool(
-            cfg!(feature = "gc"),
-            "gc",
+        Self::check_bool(
             reference_types,
             other.contains(F::REFERENCE_TYPES),
             "WebAssembly reference types support",
         )?;
-        Self::check_cfg_bool(
-            cfg!(feature = "gc"),
-            "gc",
+        Self::check_bool(
             function_references,
             other.contains(F::FUNCTION_REFERENCES),
             "WebAssembly function-references support",
         )?;
-        Self::check_cfg_bool(
-            cfg!(feature = "gc"),
-            "gc",
+        Self::check_bool(
             gc,
             other.contains(F::GC),
             "WebAssembly garbage collection support",
         )?;
-
         Self::check_bool(
             multi_value,
             other.contains(F::MULTI_VALUE),
@@ -568,6 +572,13 @@ impl Metadata<'_> {
             other.contains(F::COMPONENT_MODEL_MULTIPLE_RETURNS),
             "WebAssembly component model support for multiple returns",
         )?;
+        Self::check_cfg_bool(
+            cfg!(feature = "gc"),
+            "gc",
+            gc_types,
+            other.contains(F::GC_TYPES),
+            "support for WebAssembly gc types",
+        )?;
 
         Ok(())
     }
@@ -632,7 +643,7 @@ mod test {
 
         match metadata.check_compatible(&engine) {
             Ok(_) => unreachable!(),
-            Err(e) => assert!(format!("{:?}", e).starts_with(
+            Err(e) => assert!(format!("{e:?}").starts_with(
                 "\
 compilation settings of module incompatible with native host
 

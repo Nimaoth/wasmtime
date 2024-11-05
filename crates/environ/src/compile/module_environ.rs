@@ -4,10 +4,11 @@ use crate::module::{
 };
 use crate::prelude::*;
 use crate::{
-    DataIndex, DefinedFuncIndex, ElemIndex, EntityIndex, EntityType, FuncIndex, GlobalIndex,
-    InitMemory, MemoryIndex, ModuleTypesBuilder, PrimaryMap, StaticMemoryInitializer, TableIndex,
-    TableInitialValue, Tunables, TypeConvert, TypeIndex, Unsigned, WasmError, WasmHeapType,
-    WasmResult, WasmValType, WasmparserTypeConverter,
+    ConstExpr, ConstOp, DataIndex, DefinedFuncIndex, ElemIndex, EngineOrModuleTypeIndex,
+    EntityIndex, EntityType, FuncIndex, GlobalIndex, IndexType, InitMemory, MemoryIndex,
+    ModuleInternedTypeIndex, ModuleTypesBuilder, PrimaryMap, SizeOverflow, StaticMemoryInitializer,
+    TableIndex, TableInitialValue, Tunables, TypeConvert, TypeIndex, Unsigned, WasmError,
+    WasmHeapTopType, WasmHeapType, WasmResult, WasmValType, WasmparserTypeConverter,
 };
 use anyhow::{bail, Result};
 use cranelift_entity::packed_option::ReservedValue;
@@ -21,7 +22,6 @@ use wasmparser::{
     FuncToValidate, FunctionBody, KnownCustom, NameSectionReader, Naming, Parser, Payload, TypeRef,
     Validator, ValidatorResources,
 };
-use wasmtime_types::{ConstExpr, ConstOp, ModuleInternedTypeIndex, SizeOverflow, WasmHeapTopType};
 
 /// Object containing the standalone environment information.
 pub struct ModuleEnvironment<'a, 'data> {
@@ -308,9 +308,7 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
                             let interned_index = self.result.module.types[index];
                             self.result.module.num_imported_funcs += 1;
                             self.result.debuginfo.wasm_file.imported_func_count += 1;
-                            EntityType::Function(wasmtime_types::EngineOrModuleTypeIndex::Module(
-                                interned_index,
-                            ))
+                            EntityType::Function(EngineOrModuleTypeIndex::Module(interned_index))
                         }
                         TypeRef::Memory(ty) => {
                             self.result.module.num_imported_memories += 1;
@@ -666,7 +664,7 @@ and for re-adding support for interface types you can see this issue:
             // that's a bug in Wasmtime as we forgot to implement something.
             other => {
                 self.validator.payload(&other)?;
-                panic!("unimplemented section in wasm file {:?}", other);
+                panic!("unimplemented section in wasm file {other:?}");
             }
         }
         Ok(())
@@ -873,10 +871,7 @@ impl TypeConvert for ModuleEnvironment<'_, '_> {
         WasmparserTypeConverter::new(&self.types, &self.result.module).lookup_heap_type(index)
     }
 
-    fn lookup_type_index(
-        &self,
-        index: wasmparser::UnpackedIndex,
-    ) -> wasmtime_types::EngineOrModuleTypeIndex {
+    fn lookup_type_index(&self, index: wasmparser::UnpackedIndex) -> EngineOrModuleTypeIndex {
         WasmparserTypeConverter::new(&self.types, &self.result.module).lookup_type_index(index)
     }
 }
@@ -957,10 +952,14 @@ impl ModuleTranslation<'_> {
             }
 
             fn eval_offset(&mut self, memory_index: MemoryIndex, expr: &ConstExpr) -> Option<u64> {
-                let mem64 = self.module.memory_plans[memory_index].memory.memory64;
-                match expr.ops() {
-                    &[ConstOp::I32Const(offset)] if !mem64 => Some(offset.unsigned().into()),
-                    &[ConstOp::I64Const(offset)] if mem64 => Some(offset.unsigned()),
+                match (
+                    expr.ops(),
+                    self.module.memory_plans[memory_index].memory.idx_type,
+                ) {
+                    (&[ConstOp::I32Const(offset)], IndexType::I32) => {
+                        Some(offset.unsigned().into())
+                    }
+                    (&[ConstOp::I64Const(offset)], IndexType::I64) => Some(offset.unsigned()),
                     _ => None,
                 }
             }
@@ -1140,7 +1139,7 @@ impl ModuleTranslation<'_> {
         // This should be large enough to support very large Wasm
         // modules with huge funcref tables, but small enough to avoid
         // OOMs or DoS on truly sparse tables.
-        const MAX_FUNC_TABLE_SIZE: u32 = 1024 * 1024;
+        const MAX_FUNC_TABLE_SIZE: u64 = 1024 * 1024;
 
         // First convert any element-initialized tables to images of just that
         // single function if the minimum size of the table allows doing so.
@@ -1156,7 +1155,7 @@ impl ModuleTranslation<'_> {
                     .skip(self.module.num_imported_tables),
             )
         {
-            let table_size = plan.table.minimum;
+            let table_size = plan.table.limits.min;
             if table_size > MAX_FUNC_TABLE_SIZE {
                 continue;
             }
@@ -1197,7 +1196,8 @@ impl ModuleTranslation<'_> {
             // include it in the statically-built array of initial
             // contents.
             let offset = match segment.offset.ops() {
-                &[ConstOp::I32Const(offset)] => offset.unsigned(),
+                &[ConstOp::I32Const(offset)] => u64::from(offset.unsigned()),
+                &[ConstOp::I64Const(offset)] => offset.unsigned(),
                 _ => break,
             };
 
@@ -1208,14 +1208,17 @@ impl ModuleTranslation<'_> {
                 Some(top) => top,
                 None => break,
             };
-            let table_size = self.module.table_plans[segment.table_index].table.minimum;
+            let table_size = self.module.table_plans[segment.table_index]
+                .table
+                .limits
+                .min;
             if top > table_size || top > MAX_FUNC_TABLE_SIZE {
                 break;
             }
 
             match self.module.table_plans[segment.table_index]
                 .table
-                .wasm_ty
+                .ref_type
                 .heap_type
                 .top()
             {

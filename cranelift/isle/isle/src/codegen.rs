@@ -1,11 +1,13 @@
 //! Generate Rust code from a series of Sequences.
 
+use crate::files::Files;
 use crate::sema::{ExternalSig, ReturnKind, Sym, Term, TermEnv, TermId, Type, TypeEnv, TypeId};
 use crate::serialize::{Block, ControlFlow, EvalStep, MatchArm};
 use crate::stablemapset::StableSet;
 use crate::trie_again::{Binding, BindingId, Constraint, RuleSet};
 use std::fmt::Write;
 use std::slice::Iter;
+use std::sync::Arc;
 
 /// Options for code generation.
 #[derive(Clone, Debug, Default)]
@@ -17,16 +19,18 @@ pub struct CodegenOptions {
 
 /// Emit Rust source code for the given type and term environments.
 pub fn codegen(
+    files: Arc<Files>,
     typeenv: &TypeEnv,
     termenv: &TermEnv,
     terms: &[(TermId, RuleSet)],
     options: &CodegenOptions,
 ) -> String {
-    Codegen::compile(typeenv, termenv, terms).generate_rust(options)
+    Codegen::compile(files, typeenv, termenv, terms).generate_rust(options)
 }
 
 #[derive(Clone, Debug)]
 struct Codegen<'a> {
+    files: Arc<Files>,
     typeenv: &'a TypeEnv,
     termenv: &'a TermEnv,
     terms: &'a [(TermId, RuleSet)],
@@ -91,11 +95,13 @@ impl<'a, W: Write> BodyContext<'a, W> {
 
 impl<'a> Codegen<'a> {
     fn compile(
+        files: Arc<Files>,
         typeenv: &'a TypeEnv,
         termenv: &'a TermEnv,
         terms: &'a [(TermId, RuleSet)],
     ) -> Codegen<'a> {
         Codegen {
+            files,
             typeenv,
             termenv,
             terms,
@@ -121,8 +127,8 @@ impl<'a> Codegen<'a> {
             "// Generated automatically from the instruction-selection DSL code in:",
         )
         .unwrap();
-        for file in &self.typeenv.filenames {
-            writeln!(code, "// - {}", file).unwrap();
+        for file in &self.files.file_names {
+            writeln!(code, "// - {file}").unwrap();
         }
 
         if !options.exclude_global_allow_pragmas {
@@ -173,7 +179,7 @@ impl<'a> Codegen<'a> {
 
         let ret_ty = match sig.ret_kind {
             ReturnKind::Plain => ret_tuple,
-            ReturnKind::Option => format!("Option<{}>", ret_tuple),
+            ReturnKind::Option => format!("Option<{ret_tuple}>"),
             ReturnKind::Iterator => format!("()"),
         };
 
@@ -335,35 +341,31 @@ impl<L: Length, C> Length for ContextIterWrapper<L, C> {{
                         code,
                         "\n/// Internal type {}: defined at {}.",
                         name,
-                        pos.pretty_print_line(&self.typeenv.filenames[..])
+                        pos.pretty_print_line(&self.files)
                     )
                     .unwrap();
 
                     // Generate the `derive`s.
                     let debug_derive = if is_nodebug { "" } else { ", Debug" };
                     if variants.iter().all(|v| v.fields.is_empty()) {
-                        writeln!(
-                            code,
-                            "#[derive(Copy, Clone, PartialEq, Eq{})]",
-                            debug_derive
-                        )
-                        .unwrap();
+                        writeln!(code, "#[derive(Copy, Clone, PartialEq, Eq{debug_derive})]")
+                            .unwrap();
                     } else {
-                        writeln!(code, "#[derive(Clone{})]", debug_derive).unwrap();
+                        writeln!(code, "#[derive(Clone{debug_derive})]").unwrap();
                     }
 
-                    writeln!(code, "pub enum {} {{", name).unwrap();
+                    writeln!(code, "pub enum {name} {{").unwrap();
                     for variant in variants {
                         let name = &self.typeenv.syms[variant.name.index()];
                         if variant.fields.is_empty() {
-                            writeln!(code, "    {},", name).unwrap();
+                            writeln!(code, "    {name},").unwrap();
                         } else {
-                            writeln!(code, "    {} {{", name).unwrap();
+                            writeln!(code, "    {name} {{").unwrap();
                             for field in &variant.fields {
                                 let name = &self.typeenv.syms[field.name.index()];
                                 let ty_name =
                                     self.typeenv.types[field.ty.index()].name(self.typeenv);
-                                writeln!(code, "        {}: {},", name, ty_name).unwrap();
+                                writeln!(code, "        {name}: {ty_name},").unwrap();
                             }
                             writeln!(code, "    }},").unwrap();
                         }
@@ -438,8 +440,8 @@ impl<L: Length, C> Length for ContextIterWrapper<L, C> {{
             write!(ctx.out, "{}) -> ", &ctx.indent)?;
             match sig.ret_kind {
                 ReturnKind::Iterator => write!(ctx.out, "()")?,
-                ReturnKind::Option => write!(ctx.out, "Option<{}>", ret)?,
-                ReturnKind::Plain => write!(ctx.out, "{}", ret)?,
+                ReturnKind::Option => write!(ctx.out, "Option<{ret}>")?,
+                ReturnKind::Plain => write!(ctx.out, "{ret}")?,
             };
 
             let last_expr = if let Some(EvalStep {
@@ -458,7 +460,7 @@ impl<L: Length, C> Length for ContextIterWrapper<L, C> {{
                         term_name,
                         termdata
                             .decl_pos
-                            .pretty_print_line(&self.typeenv.filenames[..])
+                            .pretty_print_line(&self.files)
                     ),
                 }
             };
@@ -644,7 +646,7 @@ impl<L: Length, C> Length for ContextIterWrapper<L, C> {{
                                 ctx.out,
                                 "{}// Rule at {}.",
                                 &ctx.indent,
-                                pos.pretty_print_line(&self.typeenv.filenames)
+                                pos.pretty_print_line(&self.files)
                             )?;
                             write!(ctx.out, "{}", &ctx.indent)?;
                             match ret_kind {
@@ -725,9 +727,9 @@ impl<L: Length, C> Length for ContextIterWrapper<L, C> {{
                         (true, false) => ("&", ""),
                         _ => ("", ""),
                     };
-                    write!(ctx.out, "{}", before)?;
+                    write!(ctx.out, "{before}")?;
                     self.emit_expr(ctx, parameter)?;
-                    write!(ctx.out, "{}", after)?;
+                    write!(ctx.out, "{after}")?;
                 }
                 if let ReturnKind::Iterator = sig.ret_kind {
                     write!(ctx.out, ", &mut v{}", result.index())?;
@@ -914,7 +916,7 @@ impl<L: Length, C> Length for ContextIterWrapper<L, C> {{
         {
             write!(ctx.out, "-{:#X}", -val)
         } else {
-            write!(ctx.out, "{:#X}", val)
+            write!(ctx.out, "{val:#X}")
         }
     }
 }

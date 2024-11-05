@@ -5,7 +5,7 @@ use crate::ir::types::*;
 
 use crate::isa;
 
-use crate::isa::riscv64::inst::*;
+use crate::isa::riscv64::{inst::*, Riscv64Backend};
 use crate::isa::CallConv;
 use crate::machinst::*;
 
@@ -14,7 +14,6 @@ use crate::ir::Signature;
 use crate::isa::riscv64::settings::Flags as RiscvFlags;
 use crate::isa::unwind::UnwindInst;
 use crate::settings;
-use crate::CodegenError;
 use crate::CodegenResult;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -28,11 +27,6 @@ pub(crate) type Riscv64Callee = Callee<Riscv64MachineDeps>;
 
 /// Support for the Riscv64 ABI from the caller side (at a callsite).
 pub(crate) type Riscv64ABICallSite = CallSite<Riscv64MachineDeps>;
-
-/// This is the limit for the size of argument and return-value areas on the
-/// stack. We place a reasonable limit here to avoid integer overflow issues
-/// with 32-bit arithmetic: for now, 128 MB.
-static STACK_ARG_RET_SIZE_LIMIT: u32 = 128 * 1024 * 1024;
 
 /// Riscv64-specific ABI behavior. This struct just serves as an implementation
 /// point for the trait; it is never actually instantiated.
@@ -78,6 +72,11 @@ impl ABIMachineSpec for Riscv64MachineDeps {
     type I = Inst;
     type F = RiscvFlags;
 
+    /// This is the limit for the size of argument and return-value areas on the
+    /// stack. We place a reasonable limit here to avoid integer overflow issues
+    /// with 32-bit arithmetic: for now, 128 MB.
+    const STACK_ARG_RET_SIZE_LIMIT: u32 = 128 * 1024 * 1024;
+
     fn word_bits() -> u32 {
         64
     }
@@ -112,18 +111,25 @@ impl ABIMachineSpec for Riscv64MachineDeps {
         // Stack space.
         let mut next_stack: u32 = 0;
 
+        let ret_area_ptr = if add_ret_area_ptr {
+            assert!(ArgsOrRets::Args == args_or_rets);
+            next_x_reg += 1;
+            Some(ABIArg::reg(
+                x_reg(x_start).to_real_reg().unwrap(),
+                I64,
+                ir::ArgumentExtension::None,
+                ir::ArgumentPurpose::Normal,
+            ))
+        } else {
+            None
+        };
+
         for param in params {
-            if let ir::ArgumentPurpose::StructArgument(size) = param.purpose {
-                let offset = next_stack;
-                assert!(size % 8 == 0, "StructArgument size is not properly aligned");
-                next_stack += size;
-                args.push(ABIArg::StructArg {
-                    pointer: None,
-                    offset: offset as i64,
-                    size: size as u64,
-                    purpose: param.purpose,
-                });
-                continue;
+            if let ir::ArgumentPurpose::StructArgument(_) = param.purpose {
+                panic!(
+                    "StructArgument parameters are not supported on riscv64. \
+                    Use regular pointer arguments instead."
+                );
             }
 
             // Find regclass(es) of the register(s) used to store a value of this type.
@@ -168,38 +174,14 @@ impl ABIMachineSpec for Riscv64MachineDeps {
                 purpose: param.purpose,
             });
         }
-        let pos: Option<usize> = if add_ret_area_ptr {
-            assert!(ArgsOrRets::Args == args_or_rets);
-            if next_x_reg <= x_end {
-                let arg = ABIArg::reg(
-                    x_reg(next_x_reg).to_real_reg().unwrap(),
-                    I64,
-                    ir::ArgumentExtension::None,
-                    ir::ArgumentPurpose::Normal,
-                );
-                args.push(arg);
-            } else {
-                let arg = ABIArg::stack(
-                    next_stack as i64,
-                    I64,
-                    ir::ArgumentExtension::None,
-                    ir::ArgumentPurpose::Normal,
-                );
-                args.push(arg);
-                next_stack += 8;
-            }
+        let pos = if let Some(ret_area_ptr) = ret_area_ptr {
+            args.push_non_formal(ret_area_ptr);
             Some(args.args().len() - 1)
         } else {
             None
         };
 
         next_stack = align_to(next_stack, Self::stack_align(call_conv));
-
-        // To avoid overflow issues, limit the arg/return size to something
-        // reasonable -- here, 128 MB.
-        if next_stack > STACK_ARG_RET_SIZE_LIMIT {
-            return Err(CodegenError::ImplLimitExceeded);
-        }
 
         Ok((next_stack, pos))
     }
@@ -287,7 +269,7 @@ impl ABIMachineSpec for Riscv64MachineDeps {
             cc: IntCC::UnsignedLessThan,
             rs1: stack_reg(),
             rs2: limit_reg,
-            trap_code: ir::TrapCode::StackOverflow,
+            trap_code: ir::TrapCode::STACK_OVERFLOW,
         });
         insts
     }
@@ -424,19 +406,16 @@ impl ABIMachineSpec for Riscv64MachineDeps {
 
     fn gen_probestack(insts: &mut SmallInstVec<Self::I>, frame_size: u32) {
         insts.extend(Inst::load_constant_u32(writable_a0(), frame_size as u64));
+        let mut info = CallInfo::empty(
+            ExternalName::LibCall(LibCall::Probestack),
+            CallConv::SystemV,
+        );
+        info.uses.push(CallArgPair {
+            vreg: a0(),
+            preg: a0(),
+        });
         insts.push(Inst::Call {
-            info: Box::new(CallInfo {
-                dest: ExternalName::LibCall(LibCall::Probestack),
-                uses: smallvec![CallArgPair {
-                    vreg: a0(),
-                    preg: a0(),
-                }],
-                defs: smallvec![],
-                clobbers: PRegSet::empty(),
-                callee_callconv: CallConv::SystemV,
-                caller_callconv: CallConv::SystemV,
-                callee_pop_size: 0,
-            }),
+            info: Box::new(info),
         });
     }
 
@@ -567,58 +546,26 @@ impl ABIMachineSpec for Riscv64MachineDeps {
         insts
     }
 
-    fn gen_call(
-        dest: &CallDest,
-        uses: CallArgList,
-        defs: CallRetList,
-        clobbers: PRegSet,
-        tmp: Writable<Reg>,
-        callee_conv: isa::CallConv,
-        caller_conv: isa::CallConv,
-        callee_pop_size: u32,
-    ) -> SmallVec<[Self::I; 2]> {
+    fn gen_call(dest: &CallDest, tmp: Writable<Reg>, info: CallInfo<()>) -> SmallVec<[Self::I; 2]> {
         let mut insts = SmallVec::new();
         match &dest {
-            &CallDest::ExtName(ref name, RelocDistance::Near) => insts.push(Inst::Call {
-                info: Box::new(CallInfo {
-                    dest: name.clone(),
-                    uses,
-                    defs,
-                    clobbers,
-                    caller_callconv: caller_conv,
-                    callee_callconv: callee_conv,
-                    callee_pop_size,
-                }),
-            }),
+            &CallDest::ExtName(ref name, RelocDistance::Near) => {
+                let info = Box::new(info.map(|()| name.clone()));
+                insts.push(Inst::Call { info })
+            }
             &CallDest::ExtName(ref name, RelocDistance::Far) => {
                 insts.push(Inst::LoadExtName {
                     rd: tmp,
                     name: Box::new(name.clone()),
                     offset: 0,
                 });
-                insts.push(Inst::CallInd {
-                    info: Box::new(CallIndInfo {
-                        rn: tmp.to_reg(),
-                        uses,
-                        defs,
-                        clobbers,
-                        caller_callconv: caller_conv,
-                        callee_callconv: callee_conv,
-                        callee_pop_size,
-                    }),
-                });
+                let info = Box::new(info.map(|()| tmp.to_reg()));
+                insts.push(Inst::CallInd { info });
             }
-            &CallDest::Reg(reg) => insts.push(Inst::CallInd {
-                info: Box::new(CallIndInfo {
-                    rn: *reg,
-                    uses,
-                    defs,
-                    clobbers,
-                    caller_callconv: caller_conv,
-                    callee_callconv: callee_conv,
-                    callee_pop_size,
-                }),
-            }),
+            &CallDest::Reg(reg) => {
+                let info = Box::new(info.map(|()| *reg));
+                insts.push(Inst::CallInd { info });
+            }
         }
         insts
     }
@@ -655,8 +602,8 @@ impl ABIMachineSpec for Riscv64MachineDeps {
                 ],
                 defs: smallvec![],
                 clobbers: Self::get_regs_clobbered_by_call(call_conv),
-                caller_callconv: call_conv,
-                callee_callconv: call_conv,
+                caller_conv: call_conv,
+                callee_conv: call_conv,
                 callee_pop_size: 0,
             }),
         });
@@ -760,7 +707,12 @@ impl ABIMachineSpec for Riscv64MachineDeps {
 }
 
 impl Riscv64ABICallSite {
-    pub fn emit_return_call(mut self, ctx: &mut Lower<Inst>, args: isle::ValueSlice) {
+    pub fn emit_return_call(
+        mut self,
+        ctx: &mut Lower<Inst>,
+        args: isle::ValueSlice,
+        _backend: &Riscv64Backend,
+    ) {
         let new_stack_arg_size =
             u32::try_from(self.sig(ctx.sigs()).sized_stack_arg_space()).unwrap();
 
@@ -773,17 +725,15 @@ impl Riscv64ABICallSite {
 
         let dest = self.dest().clone();
         let uses = self.take_uses();
-        let info = Box::new(ReturnCallInfo {
-            uses,
-            new_stack_arg_size,
-        });
 
         match dest {
             CallDest::ExtName(name, RelocDistance::Near) => {
-                ctx.emit(Inst::ReturnCall {
-                    callee: Box::new(name),
-                    info,
+                let info = Box::new(ReturnCallInfo {
+                    dest: name,
+                    uses,
+                    new_stack_arg_size,
                 });
+                ctx.emit(Inst::ReturnCall { info });
             }
             CallDest::ExtName(name, RelocDistance::Far) => {
                 let callee = ctx.alloc_tmp(ir::types::I64).only_reg().unwrap();
@@ -792,12 +742,21 @@ impl Riscv64ABICallSite {
                     name: Box::new(name),
                     offset: 0,
                 });
-                ctx.emit(Inst::ReturnCallInd {
-                    callee: callee.to_reg(),
-                    info,
+                let info = Box::new(ReturnCallInfo {
+                    dest: callee.to_reg(),
+                    uses,
+                    new_stack_arg_size,
                 });
+                ctx.emit(Inst::ReturnCallInd { info });
             }
-            CallDest::Reg(callee) => ctx.emit(Inst::ReturnCallInd { callee, info }),
+            CallDest::Reg(callee) => {
+                let info = Box::new(ReturnCallInfo {
+                    dest: callee,
+                    uses,
+                    new_stack_arg_size,
+                });
+                ctx.emit(Inst::ReturnCallInd { info });
+            }
         }
     }
 }

@@ -1,4 +1,5 @@
 use crate::func::HostFunc;
+use crate::hash_map::{Entry, HashMap};
 use crate::instance::InstancePre;
 use crate::store::StoreOpaque;
 use crate::{prelude::*, IntoFunc};
@@ -13,7 +14,6 @@ use core::future::Future;
 use core::marker;
 #[cfg(feature = "async")]
 use core::pin::Pin;
-use hashbrown::hash_map::{Entry, HashMap};
 use log::warn;
 
 /// Structure used to link wasm modules/instances together.
@@ -129,7 +129,7 @@ pub(crate) enum DefinitionType {
     // information but additionally the current size of the table/memory, as
     // this is used during linking since the min size specified in the type may
     // no longer be the current size of the table/memory.
-    Table(wasmtime_environ::Table, u32),
+    Table(wasmtime_environ::Table, u64),
     Memory(wasmtime_environ::Memory, u64),
 }
 
@@ -1019,7 +1019,7 @@ impl<T> Linker<T> {
             Entry::Occupied(_) if !self.allow_shadowing => {
                 let module = &self.strings[key.module];
                 let desc = match self.strings.get(key.name) {
-                    Some(name) => format!("{}::{}", module, name),
+                    Some(name) => format!("{module}::{name}"),
                     None => module.to_string(),
                 };
                 bail!("import of `{}` defined twice", desc)
@@ -1226,7 +1226,7 @@ impl<T> Linker<T> {
     pub fn iter<'a: 'p, 'p>(
         &'a self,
         mut store: impl AsContextMut<Data = T> + 'p,
-    ) -> impl Iterator<Item = (&str, &str, Extern)> + 'p {
+    ) -> impl Iterator<Item = (&'a str, &'a str, Extern)> + 'p {
         self.map.iter().map(move |(key, item)| {
             let store = store.as_context_mut();
             (

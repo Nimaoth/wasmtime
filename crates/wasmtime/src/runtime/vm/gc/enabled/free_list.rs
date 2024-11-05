@@ -14,8 +14,8 @@ pub(crate) struct FreeList {
 
 /// Our minimum and maximum supported alignment. Every allocation is aligned to
 /// this.
-const ALIGN_USIZE: usize = 8;
-const ALIGN_U32: u32 = ALIGN_USIZE as u32;
+const ALIGN_U32: u32 = 8;
+const ALIGN_USIZE: usize = ALIGN_U32 as usize;
 
 /// Our minimum allocation size.
 const MIN_BLOCK_SIZE: u32 = 24;
@@ -313,8 +313,9 @@ fn round_usize_down_to_pow2(value: usize, divisor: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hash_map::HashMap;
     use proptest::prelude::*;
-    use std::{collections::HashMap, num::NonZeroUsize};
+    use std::num::NonZeroUsize;
 
     fn free_list_block_len_and_size(free_list: &FreeList) -> (usize, Option<usize>) {
         let len = free_list.free_block_index_to_len.len();

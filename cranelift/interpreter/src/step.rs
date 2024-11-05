@@ -58,7 +58,7 @@ where
         if ctrl_ty.is_invalid() {
             String::new()
         } else {
-            format!(".{}", ctrl_ty)
+            format!(".{ctrl_ty}")
         }
     );
 
@@ -150,39 +150,39 @@ where
     let assign_or_trap = |value: ValueResult<DataValue>| match value {
         Ok(v) => Ok(assign(v)),
         Err(ValueError::IntegerDivisionByZero) => Ok(ControlFlow::Trap(CraneliftTrap::User(
-            TrapCode::IntegerDivisionByZero,
+            TrapCode::INTEGER_DIVISION_BY_ZERO,
         ))),
         Err(ValueError::IntegerOverflow) => Ok(ControlFlow::Trap(CraneliftTrap::User(
-            TrapCode::IntegerOverflow,
+            TrapCode::INTEGER_OVERFLOW,
         ))),
         Err(e) => Err(e),
     };
 
     let memerror_to_trap = |e: MemoryError| match e {
-        MemoryError::InvalidAddress(_) => TrapCode::HeapOutOfBounds,
-        MemoryError::InvalidAddressType(_) => TrapCode::HeapOutOfBounds,
-        MemoryError::InvalidOffset { .. } => TrapCode::HeapOutOfBounds,
-        MemoryError::InvalidEntry { .. } => TrapCode::HeapOutOfBounds,
-        MemoryError::OutOfBoundsStore { mem_flags, .. } => mem_flags
-            .trap_code()
-            .expect("store with notrap flag should not trap"),
-        MemoryError::OutOfBoundsLoad { mem_flags, .. } => mem_flags
-            .trap_code()
-            .expect("load with notrap flag should not trap"),
-        MemoryError::MisalignedLoad { .. } => TrapCode::HeapMisaligned,
-        MemoryError::MisalignedStore { .. } => TrapCode::HeapMisaligned,
+        MemoryError::InvalidAddress(_)
+        | MemoryError::InvalidAddressType(_)
+        | MemoryError::InvalidOffset { .. }
+        | MemoryError::InvalidEntry { .. } => CraneliftTrap::User(TrapCode::HEAP_OUT_OF_BOUNDS),
+        MemoryError::OutOfBoundsStore { mem_flags, .. }
+        | MemoryError::OutOfBoundsLoad { mem_flags, .. } => CraneliftTrap::User(
+            mem_flags
+                .trap_code()
+                .expect("op with notrap flag should not trap"),
+        ),
+        MemoryError::MisalignedLoad { .. } => CraneliftTrap::HeapMisaligned,
+        MemoryError::MisalignedStore { .. } => CraneliftTrap::HeapMisaligned,
     };
 
     // Assigns or traps depending on the value of the result
     let assign_or_memtrap = |res| match res {
         Ok(v) => assign(v),
-        Err(e) => ControlFlow::Trap(CraneliftTrap::User(memerror_to_trap(e))),
+        Err(e) => ControlFlow::Trap(memerror_to_trap(e)),
     };
 
     // Continues or traps depending on the value of the result
     let continue_or_memtrap = |res| match res {
         Ok(_) => ControlFlow::Continue,
-        Err(e) => ControlFlow::Trap(CraneliftTrap::User(memerror_to_trap(e))),
+        Err(e) => ControlFlow::Trap(memerror_to_trap(e)),
     };
 
     let calculate_addr =
@@ -275,9 +275,7 @@ where
             // guarantees that the user has ran that.
             let args_match = validate_signature_params(&signature.params[..], &args[..]);
             if !args_match {
-                return Ok(ControlFlow::Trap(CraneliftTrap::User(
-                    TrapCode::BadSignature,
-                )));
+                return Ok(ControlFlow::Trap(CraneliftTrap::BadSignature));
             }
 
             Ok(match func_ref {
@@ -295,7 +293,7 @@ where
                     // We don't transfer control to a libcall, we just execute it and return the results
                     let res = libcall_handler(libcall, args);
                     let res = match res {
-                        Err(trap) => return Ok(ControlFlow::Trap(CraneliftTrap::User(trap))),
+                        Err(trap) => return Ok(ControlFlow::Trap(trap)),
                         Ok(rets) => rets,
                     };
 
@@ -303,7 +301,7 @@ where
                     if validate_signature_params(&signature.returns[..], &res[..]) {
                         ControlFlow::Assign(res)
                     } else {
-                        ControlFlow::Trap(CraneliftTrap::User(TrapCode::BadSignature))
+                        ControlFlow::Trap(CraneliftTrap::BadSignature)
                     }
                 }
             })
@@ -560,7 +558,6 @@ where
         Opcode::F64const => assign(imm()),
         Opcode::F128const => assign(imm()),
         Opcode::Vconst => assign(imm()),
-        Opcode::Null => unimplemented!("Null"),
         Opcode::Nop => ControlFlow::Continue,
         Opcode::Select | Opcode::SelectSpectreGuard => choose(arg(0).into_bool()?, arg(1), arg(2)),
         Opcode::Bitselect => assign(bitselect(arg(0), arg(1), arg(2))?),
@@ -719,24 +716,24 @@ where
             let (sum, carry) = arg(0).smul_overflow(arg(1))?;
             assign_multiple(&[sum, DataValueExt::bool(carry, false, types::I8)?])
         }
-        Opcode::IaddCin => choose(
-            DataValueExt::into_bool(arg(2))?,
-            DataValueExt::add(
-                DataValueExt::add(arg(0), arg(1))?,
-                DataValueExt::int(1, ctrl_ty)?,
-            )?,
-            DataValueExt::add(arg(0), arg(1))?,
-        ),
-        Opcode::IaddCarry => {
-            let mut sum = DataValueExt::add(arg(0), arg(1))?;
-            let mut carry = arg(0).sadd_checked(arg(1))?.is_none();
+        Opcode::SaddOverflowCin => {
+            let (mut sum, mut carry) = arg(0).sadd_overflow(arg(1))?;
 
             if DataValueExt::into_bool(arg(2))? {
-                carry |= sum
-                    .clone()
-                    .sadd_checked(DataValueExt::int(1, ctrl_ty)?)?
-                    .is_none();
-                sum = DataValueExt::add(sum, DataValueExt::int(1, ctrl_ty)?)?;
+                let (sum2, carry2) = sum.sadd_overflow(DataValueExt::int(1, ctrl_ty)?)?;
+                carry |= carry2;
+                sum = sum2;
+            }
+
+            assign_multiple(&[sum, DataValueExt::bool(carry, false, types::I8)?])
+        }
+        Opcode::UaddOverflowCin => {
+            let (mut sum, mut carry) = arg(0).uadd_overflow(arg(1))?;
+
+            if DataValueExt::into_bool(arg(2))? {
+                let (sum2, carry2) = sum.uadd_overflow(DataValueExt::int(1, ctrl_ty)?)?;
+                carry |= carry2;
+                sum = sum2;
             }
 
             assign_multiple(&[sum, DataValueExt::bool(carry, false, types::I8)?])
@@ -750,23 +747,27 @@ where
                 assign(sum)
             }
         }
-        Opcode::IsubBin => choose(
-            DataValueExt::into_bool(arg(2))?,
-            DataValueExt::sub(
-                arg(0),
-                DataValueExt::add(arg(1), DataValueExt::int(1, ctrl_ty)?)?,
-            )?,
-            DataValueExt::sub(arg(0), arg(1))?,
-        ),
-        Opcode::IsubBorrow => {
-            let rhs = if DataValueExt::into_bool(arg(2))? {
-                DataValueExt::add(arg(1), DataValueExt::int(1, ctrl_ty)?)?
-            } else {
-                arg(1)
-            };
-            let borrow = arg(0) < rhs;
-            let sum = DataValueExt::sub(arg(0), rhs)?;
-            assign_multiple(&[sum, DataValueExt::bool(borrow, false, types::I8)?])
+        Opcode::SsubOverflowBin => {
+            let (mut sub, mut carry) = arg(0).ssub_overflow(arg(1))?;
+
+            if DataValueExt::into_bool(arg(2))? {
+                let (sub2, carry2) = sub.ssub_overflow(DataValueExt::int(1, ctrl_ty)?)?;
+                carry |= carry2;
+                sub = sub2;
+            }
+
+            assign_multiple(&[sub, DataValueExt::bool(carry, false, types::I8)?])
+        }
+        Opcode::UsubOverflowBin => {
+            let (mut sub, mut carry) = arg(0).usub_overflow(arg(1))?;
+
+            if DataValueExt::into_bool(arg(2))? {
+                let (sub2, carry2) = sub.usub_overflow(DataValueExt::int(1, ctrl_ty)?)?;
+                carry |= carry2;
+                sub = sub2;
+            }
+
+            assign_multiple(&[sub, DataValueExt::bool(carry, false, types::I8)?])
         }
         Opcode::Band => binary(DataValueExt::and, arg(0), arg(1))?,
         Opcode::Bor => binary(DataValueExt::or, arg(0), arg(1))?,
@@ -873,8 +874,6 @@ where
         Opcode::Floor => unary(DataValueExt::floor, arg(0))?,
         Opcode::Trunc => unary(DataValueExt::trunc, arg(0))?,
         Opcode::Nearest => unary(DataValueExt::nearest, arg(0))?,
-        Opcode::IsNull => unimplemented!("IsNull"),
-        Opcode::IsInvalid => unimplemented!("IsInvalid"),
         Opcode::Bitcast | Opcode::ScalarToVector => {
             let input_ty = inst_context.type_of(inst_context.args()[0]).unwrap();
             let lanes = &if input_ty.is_vector() {
@@ -1049,7 +1048,7 @@ where
             // NaN check
             if arg(0).is_nan()? {
                 return Ok(ControlFlow::Trap(CraneliftTrap::User(
-                    TrapCode::BadConversionToInteger,
+                    TrapCode::BAD_CONVERSION_TO_INTEGER,
                 )));
             }
             let x = arg(0).into_float()? as i128;
@@ -1063,7 +1062,7 @@ where
             // bounds check
             if overflow {
                 return Ok(ControlFlow::Trap(CraneliftTrap::User(
-                    TrapCode::IntegerOverflow,
+                    TrapCode::INTEGER_OVERFLOW,
                 )));
             }
             // perform the conversion.
@@ -1180,7 +1179,7 @@ where
                 .and_then(|addr| state.checked_load(addr, ctrl_ty, mem_flags));
             let prev_val = match loaded {
                 Ok(v) => v,
-                Err(e) => return Ok(ControlFlow::Trap(CraneliftTrap::User(memerror_to_trap(e)))),
+                Err(e) => return Ok(ControlFlow::Trap(memerror_to_trap(e))),
             };
             let prev_val_to_assign = prev_val.clone();
             let replace = match op {
@@ -1207,7 +1206,7 @@ where
                 .and_then(|addr| state.checked_load(addr, ctrl_ty, mem_flags));
             let loaded_val = match loaded {
                 Ok(v) => v,
-                Err(e) => return Ok(ControlFlow::Trap(CraneliftTrap::User(memerror_to_trap(e)))),
+                Err(e) => return Ok(ControlFlow::Trap(memerror_to_trap(e))),
             };
             let expected_val = arg(1);
             let val_to_assign = if loaded_val == expected_val {
@@ -1286,6 +1285,7 @@ where
         Opcode::X86Pmulhrsw => unimplemented!("X86Pmulhrsw"),
         Opcode::X86Pmaddubsw => unimplemented!("X86Pmaddubsw"),
         Opcode::X86Cvtt2dq => unimplemented!("X86Cvtt2dq"),
+        Opcode::StackSwitch => unimplemented!("StackSwitch"),
     })
 }
 
@@ -1331,6 +1331,12 @@ pub enum ControlFlow<'a> {
 pub enum CraneliftTrap {
     #[error("user code: {0}")]
     User(TrapCode),
+    #[error("bad signature")]
+    BadSignature,
+    #[error("unreachable code has been reached")]
+    UnreachableCodeReached,
+    #[error("heap is misaligned")]
+    HeapMisaligned,
     #[error("user debug")]
     Debug,
 }

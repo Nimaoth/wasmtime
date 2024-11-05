@@ -16,11 +16,11 @@ use wasmtime_environ::{VMGcKind, VMSharedTypeIndex};
 ///
 /// ```ignore
 /// struct VMGcHeader {
-///     // Highest 2 bits.
+///     // Highest 6 bits.
 ///     kind: VMGcKind,
 ///
-///     // 30 bits available for the `GcRuntime` to make use of however it sees fit.
-///     reserved: u30,
+///     // 26 bits available for the `GcRuntime` to make use of however it sees fit.
+///     reserved: u26,
 ///
 ///     // The `VMSharedTypeIndex` for this GC object, if it isn't an
 ///     // `externref` (or an `externref` re-wrapped as an `anyref`). `None` is
@@ -29,6 +29,7 @@ use wasmtime_environ::{VMGcKind, VMSharedTypeIndex};
 /// }
 /// ```
 #[repr(align(8))]
+#[derive(Debug, Clone, Copy)]
 pub struct VMGcHeader(u64);
 
 unsafe impl GcHeapObject for VMGcHeader {
@@ -84,9 +85,8 @@ impl VMGcHeader {
     ///
     /// Panics if the given `value` has any of the upper 6 bits set.
     pub fn set_reserved_u26(&mut self, value: u32) {
-        assert_eq!(
-            value & VMGcKind::MASK,
-            0,
+        assert!(
+            VMGcKind::value_fits_in_unused_bits(value),
             "VMGcHeader::set_reserved_u26 with value using more than 26 bits"
         );
         self.0 |= u64::from(value) << 32;
@@ -177,7 +177,7 @@ impl fmt::UpperHex for VMGcRef {
 
 impl fmt::Pointer for VMGcRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:#x}", self)
+        write!(f, "{self:#x}")
     }
 }
 
@@ -233,22 +233,6 @@ impl VMGcRef {
         VMGcRef::from_raw_non_zero_u32(non_zero)
     }
 
-    /// Create a new `VMGcRef` from a raw `r64` value from Cranelift.
-    ///
-    /// Returns an error if `raw` cannot be losslessly converted from a `u64`
-    /// into a `u32`.
-    ///
-    /// Returns `Ok(None)` if `raw` is zero (aka a "null" `VMGcRef`).
-    ///
-    /// This method only exists because we can't currently use Cranelift's `r32`
-    /// type on 64-bit platforms. We should instead have a `from_r32` method.
-    pub fn from_r64(raw: u64) -> Result<Option<Self>> {
-        let raw = u32::try_from(raw & (u32::MAX as u64))
-            .err2anyhow()
-            .with_context(|| format!("invalid r64: {raw:#x} cannot be converted into a u32"))?;
-        Ok(Self::from_raw_u32(raw))
-    }
-
     /// Copy this `VMGcRef` without running the GC's clone barriers.
     ///
     /// Prefer calling `clone(&mut GcStore)` instead! This is mostly an internal
@@ -276,24 +260,6 @@ impl VMGcRef {
     /// actually a reference to a GC object or is an `i31ref`.
     pub fn as_raw_u32(&self) -> u32 {
         self.0.get()
-    }
-
-    /// Get this GC reference as a raw `r64` value for passing to Cranelift.
-    ///
-    /// This method only exists because we can't currently use Cranelift's `r32`
-    /// type on 64-bit platforms. We should instead be able to pass `VMGcRef`
-    /// into compiled code directly.
-    pub fn into_r64(self) -> u64 {
-        u64::from(self.0.get())
-    }
-
-    /// Get this GC reference as a raw `r64` value for passing to Cranelift.
-    ///
-    /// This method only exists because we can't currently use Cranelift's `r32`
-    /// type on 64-bit platforms. We should instead be able to pass `VMGcRef`
-    /// into compiled code directly.
-    pub fn as_r64(&self) -> u64 {
-        u64::from(self.0.get())
     }
 
     /// Creates a typed GC reference from `self`, checking that `self` actually
@@ -332,6 +298,17 @@ impl VMGcRef {
             gc_ref: self,
             _phantom: marker::PhantomData,
         }
+    }
+
+    /// Is this GC reference pointing to a `T`?
+    pub fn is_typed<T>(&self, gc_heap: &impl GcHeap) -> bool
+    where
+        T: GcHeapObject,
+    {
+        if self.is_i31() {
+            return false;
+        }
+        T::is(gc_heap.header(&self))
     }
 
     /// Borrow `self` as a typed GC reference, checking that `self` actually is

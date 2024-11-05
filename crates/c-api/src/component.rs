@@ -107,7 +107,7 @@ pub extern "C" fn wasmtime_component_store_limiter(
         limiter = limiter.memory_size(memory_size as usize);
     }
     if table_elements >= 0 {
-        limiter = limiter.table_elements(table_elements as u32);
+        limiter = limiter.table_elements(table_elements as usize);
     }
     if instances >= 0 {
         limiter = limiter.instances(instances as usize);

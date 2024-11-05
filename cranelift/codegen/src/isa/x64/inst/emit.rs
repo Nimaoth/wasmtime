@@ -138,8 +138,7 @@ pub(crate) fn emit(
     let isa_requirements = inst.available_in_any_isa();
     if !isa_requirements.is_empty() && !isa_requirements.iter().all(matches_isa_flags) {
         panic!(
-            "Cannot emit inst '{:?}' for target; failed to match ISA requirements: {:?}",
-            inst, isa_requirements
+            "Cannot emit inst '{inst:?}' for target; failed to match ISA requirements: {isa_requirements:?}"
         )
     }
 
@@ -165,9 +164,9 @@ pub(crate) fn emit(
             let mut rex = RexFlags::from(*size);
             let (opcode_r, opcode_m, subopcode_i) = match op {
                 AluRmiROpcode::Add => (0x01, 0x03, 0),
-                AluRmiROpcode::Adc => (0x11, 0x03, 2),
+                AluRmiROpcode::Adc => (0x11, 0x13, 2),
                 AluRmiROpcode::Sub => (0x29, 0x2B, 5),
-                AluRmiROpcode::Sbb => (0x19, 0x2B, 3),
+                AluRmiROpcode::Sbb => (0x19, 0x1B, 3),
                 AluRmiROpcode::And => (0x21, 0x23, 4),
                 AluRmiROpcode::Or => (0x09, 0x0B, 1),
                 AluRmiROpcode::Xor => (0x31, 0x33, 6),
@@ -683,6 +682,42 @@ pub(crate) fn emit(
             emit_simm(sink, imm_size, *src2 as u32);
         }
 
+        Inst::MulX {
+            size,
+            src1,
+            src2,
+            dst_lo,
+            dst_hi,
+        } => {
+            let src1 = src1.to_reg();
+            let dst_lo = dst_lo.to_reg().to_reg();
+            let dst_hi = dst_hi.to_reg().to_reg();
+            debug_assert_eq!(src1, regs::rdx());
+            let src2 = match src2.clone().to_reg_mem().clone() {
+                RegMem::Reg { reg } => {
+                    RegisterOrAmode::Register(reg.to_real_reg().unwrap().hw_enc().into())
+                }
+                RegMem::Mem { addr } => RegisterOrAmode::Amode(addr.finalize(state, sink)),
+            };
+
+            let dst_hi = dst_hi.to_real_reg().unwrap().hw_enc();
+            let dst_lo = if dst_lo.is_invalid_sentinel() {
+                dst_hi
+            } else {
+                dst_lo.to_real_reg().unwrap().hw_enc()
+            };
+
+            VexInstruction::new()
+                .prefix(LegacyPrefixes::_F2)
+                .map(OpcodeMap::_0F38)
+                .w(*size == OperandSize::Size64)
+                .opcode(0xf6)
+                .reg(dst_hi)
+                .vvvv(dst_lo)
+                .rm(src2)
+                .encode(sink);
+        }
+
         Inst::SignExtendData { size, src, dst } => {
             let src = src.to_reg();
             let dst = dst.to_reg().to_reg();
@@ -786,7 +821,7 @@ pub(crate) fn emit(
             let inst = match size {
                 OperandSize::Size8 => Inst::div8(
                     DivSignedness::Signed,
-                    TrapCode::IntegerDivisionByZero,
+                    TrapCode::INTEGER_DIVISION_BY_ZERO,
                     RegMem::reg(divisor),
                     Gpr::unwrap_new(regs::rax()),
                     Writable::from_reg(Gpr::unwrap_new(regs::rax())),
@@ -794,7 +829,7 @@ pub(crate) fn emit(
                 _ => Inst::div(
                     size,
                     DivSignedness::Signed,
-                    TrapCode::IntegerDivisionByZero,
+                    TrapCode::INTEGER_DIVISION_BY_ZERO,
                     RegMem::reg(divisor),
                     Gpr::unwrap_new(regs::rax()),
                     Gpr::unwrap_new(regs::rdx()),
@@ -1232,7 +1267,7 @@ pub(crate) fn emit(
                     SseOpcode::Psrlw => (0x0F71, 2),
                     SseOpcode::Psrld => (0x0F72, 2),
                     SseOpcode::Psrlq => (0x0F73, 2),
-                    _ => panic!("invalid opcode: {}", opcode),
+                    _ => panic!("invalid opcode: {opcode}"),
                 };
                 let dst_enc = reg_enc(dst);
                 emit_std_enc_enc(sink, prefix, opcode_bytes, 2, reg_digit, dst_enc, rex);
@@ -1250,7 +1285,7 @@ pub(crate) fn emit(
                     SseOpcode::Psrlw => 0x0FD1,
                     SseOpcode::Psrld => 0x0FD2,
                     SseOpcode::Psrlq => 0x0FD3,
-                    _ => panic!("invalid opcode: {}", opcode),
+                    _ => panic!("invalid opcode: {opcode}"),
                 };
 
                 match src2 {
@@ -1594,16 +1629,8 @@ pub(crate) fn emit(
             inst.emit(sink, info, state);
         }
 
-        Inst::CallKnown {
-            dest,
-            info: call_info,
-            ..
-        } => {
-            let (stack_map, user_stack_map) = state.take_stack_map();
-            if let Some(s) = stack_map {
-                sink.add_stack_map(StackMapExtent::UpcomingBytes(5), s);
-            }
-            if let Some(s) = user_stack_map {
+        Inst::CallKnown { info: call_info } => {
+            if let Some(s) = state.take_stack_map() {
                 let offset = sink.cur_offset() + 5;
                 sink.push_user_stack_map(state, offset, s);
             }
@@ -1611,29 +1638,24 @@ pub(crate) fn emit(
             sink.put1(0xE8);
             // The addend adjusts for the difference between the end of the instruction and the
             // beginning of the immediate field.
-            emit_reloc(sink, Reloc::X86CallPCRel4, &dest, -4);
+            emit_reloc(sink, Reloc::X86CallPCRel4, &call_info.dest, -4);
             sink.put4(0);
             sink.add_call_site();
 
             // Reclaim the outgoing argument area that was released by the callee, to ensure that
             // StackAMode values are always computed from a consistent SP.
-            if let Some(call_info) = call_info {
-                if call_info.callee_pop_size > 0 {
-                    Inst::alu_rmi_r(
-                        OperandSize::Size64,
-                        AluRmiROpcode::Sub,
-                        RegMemImm::imm(call_info.callee_pop_size),
-                        Writable::from_reg(regs::rsp()),
-                    )
-                    .emit(sink, info, state);
-                }
+            if call_info.callee_pop_size > 0 {
+                Inst::alu_rmi_r(
+                    OperandSize::Size64,
+                    AluRmiROpcode::Sub,
+                    RegMemImm::imm(call_info.callee_pop_size),
+                    Writable::from_reg(regs::rsp()),
+                )
+                .emit(sink, info, state);
             }
         }
 
-        Inst::ReturnCallKnown {
-            callee,
-            info: call_info,
-        } => {
+        Inst::ReturnCallKnown { info: call_info } => {
             emit_return_call_common_sequence(sink, info, state, &call_info);
 
             // Finally, jump to the callee!
@@ -1644,16 +1666,13 @@ pub(crate) fn emit(
             sink.put1(0xE9);
             // The addend adjusts for the difference between the end of the instruction and the
             // beginning of the immediate field.
-            emit_reloc(sink, Reloc::X86CallPCRel4, &callee, -4);
+            emit_reloc(sink, Reloc::X86CallPCRel4, &call_info.dest, -4);
             sink.put4(0);
             sink.add_call_site();
         }
 
-        Inst::ReturnCallUnknown {
-            callee,
-            info: call_info,
-        } => {
-            let callee = *callee;
+        Inst::ReturnCallUnknown { info: call_info } => {
+            let callee = call_info.dest;
 
             emit_return_call_common_sequence(sink, info, state, &call_info);
 
@@ -1665,13 +1684,10 @@ pub(crate) fn emit(
         }
 
         Inst::CallUnknown {
-            dest,
-            info: call_info,
-            ..
+            info: call_info, ..
         } => {
-            let dest = dest.clone();
+            let dest = call_info.dest.clone();
 
-            let start_offset = sink.cur_offset();
             match dest {
                 RegMem::Reg { reg } => {
                     let reg_enc = int_reg_enc(reg);
@@ -1701,11 +1717,7 @@ pub(crate) fn emit(
                 }
             }
 
-            let (stack_map, user_stack_map) = state.take_stack_map();
-            if let Some(s) = stack_map {
-                sink.add_stack_map(StackMapExtent::StartedAtOffset(start_offset), s);
-            }
-            if let Some(s) = user_stack_map {
+            if let Some(s) = state.take_stack_map() {
                 let offset = sink.cur_offset();
                 sink.push_user_stack_map(state, offset, s);
             }
@@ -1714,16 +1726,14 @@ pub(crate) fn emit(
 
             // Reclaim the outgoing argument area that was released by the callee, to ensure that
             // StackAMode values are always computed from a consistent SP.
-            if let Some(call_info) = call_info {
-                if call_info.callee_pop_size > 0 {
-                    Inst::alu_rmi_r(
-                        OperandSize::Size64,
-                        AluRmiROpcode::Sub,
-                        RegMemImm::imm(call_info.callee_pop_size),
-                        Writable::from_reg(regs::rsp()),
-                    )
-                    .emit(sink, info, state);
-                }
+            if call_info.callee_pop_size > 0 {
+                Inst::alu_rmi_r(
+                    OperandSize::Size64,
+                    AluRmiROpcode::Sub,
+                    RegMemImm::imm(call_info.callee_pop_size),
+                    Writable::from_reg(regs::rsp()),
+                )
+                .emit(sink, info, state);
             }
         }
 
@@ -1737,6 +1747,123 @@ pub(crate) fn emit(
         Inst::Ret { stack_bytes_to_pop } => {
             sink.put1(0xC2);
             sink.put2(u16::try_from(*stack_bytes_to_pop).unwrap());
+        }
+
+        Inst::StackSwitchBasic {
+            store_context_ptr,
+            load_context_ptr,
+            in_payload0,
+            out_payload0,
+        } => {
+            // Note that we do not emit anything for preserving and restoring
+            // ordinary registers here: That's taken care of by regalloc for us,
+            // since we marked this instruction as clobbering all registers.
+            //
+            // Also note that we do nothing about passing the single payload
+            // value: We've informed regalloc that it is sent and received via
+            // the fixed register given by [stack_switch::payload_register]
+
+            let (tmp1, tmp2) = {
+                // Ideally we would just ask regalloc for two temporary registers.
+                // However, adding any early defs to the constraints on StackSwitch
+                // causes TooManyLiveRegs. Fortunately, we can manually find tmp
+                // registers without regalloc: Since our instruction clobbers all
+                // registers, we can simply pick any register that is not assigned
+                // to the operands.
+
+                let all = crate::isa::x64::abi::ALL_CLOBBERS;
+
+                let used_regs = [
+                    **load_context_ptr,
+                    **store_context_ptr,
+                    **in_payload0,
+                    *out_payload0.to_reg(),
+                ];
+
+                let mut tmps = all.into_iter().filter_map(|preg| {
+                    let reg: Reg = preg.into();
+                    if !used_regs.contains(&reg) {
+                        WritableGpr::from_writable_reg(isle::WritableReg::from_reg(reg))
+                    } else {
+                        None
+                    }
+                });
+                (tmps.next().unwrap(), tmps.next().unwrap())
+            };
+
+            let layout = stack_switch::control_context_layout();
+            let rsp_offset = layout.stack_pointer_offset as i32;
+            let pc_offset = layout.ip_offset as i32;
+            let rbp_offset = layout.frame_pointer_offset as i32;
+
+            // Location to which someone switch-ing back to this stack will jump
+            // to: Right behind the `StackSwitch` instruction
+            let resume = sink.get_label();
+
+            //
+            // For RBP and RSP we do the following:
+            // - Load new value for register from `load_context_ptr` +
+            // corresponding offset.
+            // - Store previous (!) value of register at `store_context_ptr` +
+            // corresponding offset.
+            //
+            // Since `load_context_ptr` and `store_context_ptr` are allowed to be
+            // equal, we need to use a temporary register here.
+            //
+
+            let mut exchange = |offset, reg| {
+                let inst = Inst::Mov64MR {
+                    src: Amode::imm_reg(offset, **load_context_ptr).into(),
+                    dst: tmp1,
+                };
+                emit(&inst, sink, info, state);
+
+                let inst = Inst::MovRM {
+                    size: OperandSize::Size64,
+                    src: Gpr::new(reg).unwrap(),
+                    dst: Amode::imm_reg(offset, **store_context_ptr).into(),
+                };
+                emit(&inst, sink, info, state);
+
+                let dst = Writable::from_reg(reg.into());
+                let inst = Inst::MovRR {
+                    size: OperandSize::Size64,
+                    src: tmp1.to_reg(),
+                    dst: WritableGpr::from_writable_reg(dst.into()).unwrap(),
+                };
+                emit(&inst, sink, info, state);
+            };
+
+            exchange(rsp_offset, regs::rsp());
+            exchange(rbp_offset, regs::rbp());
+
+            //
+            // Load target PC, store resume PC, jump to target PC
+            //
+
+            let inst = Inst::Mov64MR {
+                src: Amode::imm_reg(pc_offset, **load_context_ptr).into(),
+                dst: tmp1,
+            };
+            emit(&inst, sink, info, state);
+
+            let amode = Amode::RipRelative { target: resume };
+            let inst = Inst::lea(amode, tmp2.map(Reg::from));
+            inst.emit(sink, info, state);
+
+            let inst = Inst::MovRM {
+                size: OperandSize::Size64,
+                src: tmp2.to_reg(),
+                dst: Amode::imm_reg(pc_offset, **store_context_ptr).into(),
+            };
+            emit(&inst, sink, info, state);
+
+            let inst = Inst::JmpUnknown {
+                target: RegMem::reg(tmp1.to_reg().into()),
+            };
+            emit(&inst, sink, info, state);
+
+            sink.bind_label(resume, state.ctrl_plane_mut());
         }
 
         Inst::JmpKnown { dst } => {
@@ -3179,7 +3306,7 @@ pub(crate) fn emit(
                 SseOpcode::Movmskps => (LegacyPrefixes::None, 0x0F50, true),
                 SseOpcode::Movmskpd => (LegacyPrefixes::_66, 0x0F50, true),
                 SseOpcode::Pmovmskb => (LegacyPrefixes::_66, 0x0FD7, true),
-                _ => panic!("unexpected opcode {:?}", op),
+                _ => panic!("unexpected opcode {op:?}"),
             };
             let rex = RexFlags::from(*dst_size);
             let (src, dst) = if dst_first { (dst, src) } else { (src, dst) };
@@ -3198,7 +3325,7 @@ pub(crate) fn emit(
                 SseOpcode::Pextrw => (LegacyPrefixes::_66, 0x0FC5, 2, OS::Size32, true),
                 SseOpcode::Pextrd => (LegacyPrefixes::_66, 0x0F3A16, 3, OS::Size32, false),
                 SseOpcode::Pextrq => (LegacyPrefixes::_66, 0x0F3A16, 3, OS::Size64, false),
-                _ => panic!("unexpected opcode {:?}", op),
+                _ => panic!("unexpected opcode {op:?}"),
             };
             let rex = RexFlags::from(dst_size);
             let (src, dst) = if dst_first { (dst, src) } else { (src, dst) };
@@ -3220,7 +3347,7 @@ pub(crate) fn emit(
                 // Movd and movq use the same opcode; the presence of the REX prefix (set below)
                 // actually determines which is used.
                 SseOpcode::Movd | SseOpcode::Movq => (LegacyPrefixes::_66, 0x0F6E),
-                _ => panic!("unexpected opcode {:?}", op),
+                _ => panic!("unexpected opcode {op:?}"),
             };
             let rex = RexFlags::from(*src_size);
             match src_e {
@@ -3272,7 +3399,7 @@ pub(crate) fn emit(
             let (prefix, opcode) = match op {
                 SseOpcode::Cvtsi2ss => (LegacyPrefixes::_F3, 0x0F2A),
                 SseOpcode::Cvtsi2sd => (LegacyPrefixes::_F2, 0x0F2A),
-                _ => panic!("unexpected opcode {:?}", op),
+                _ => panic!("unexpected opcode {op:?}"),
             };
             let rex = RexFlags::from(*src2_size);
             match src2 {
@@ -3565,7 +3692,7 @@ pub(crate) fn emit(
                     inst.emit(sink, info, state);
                 }
             } else {
-                let inst = Inst::trap_if(CC::P, TrapCode::BadConversionToInteger);
+                let inst = Inst::trap_if(CC::P, TrapCode::BAD_CONVERSION_TO_INTEGER);
                 inst.emit(sink, info, state);
 
                 // Check if INT_MIN was the correct result: determine the smallest floating point
@@ -3605,7 +3732,7 @@ pub(crate) fn emit(
                 inst.emit(sink, info, state);
 
                 // no trap if src >= or > threshold
-                let inst = Inst::trap_if(no_overflow_cc.invert(), TrapCode::IntegerOverflow);
+                let inst = Inst::trap_if(no_overflow_cc.invert(), TrapCode::INTEGER_OVERFLOW);
                 inst.emit(sink, info, state);
 
                 // If positive, it was a real overflow.
@@ -3618,7 +3745,7 @@ pub(crate) fn emit(
                 inst.emit(sink, info, state);
 
                 // no trap if 0 >= src
-                let inst = Inst::trap_if(CC::B, TrapCode::IntegerOverflow);
+                let inst = Inst::trap_if(CC::B, TrapCode::INTEGER_OVERFLOW);
                 inst.emit(sink, info, state);
             }
 
@@ -3730,7 +3857,7 @@ pub(crate) fn emit(
                 sink.bind_label(not_nan, state.ctrl_plane_mut());
             } else {
                 // Trap.
-                let inst = Inst::trap_if(CC::P, TrapCode::BadConversionToInteger);
+                let inst = Inst::trap_if(CC::P, TrapCode::BAD_CONVERSION_TO_INTEGER);
                 inst.emit(sink, info, state);
             }
 
@@ -3760,7 +3887,7 @@ pub(crate) fn emit(
                 inst.emit(sink, info, state);
             } else {
                 // Trap.
-                let inst = Inst::trap(TrapCode::IntegerOverflow);
+                let inst = Inst::trap(TrapCode::INTEGER_OVERFLOW);
                 inst.emit(sink, info, state);
             }
 
@@ -3801,7 +3928,7 @@ pub(crate) fn emit(
                 inst.emit(sink, info, state);
                 sink.bind_label(next_is_large, state.ctrl_plane_mut());
             } else {
-                let inst = Inst::trap_if(CC::L, TrapCode::IntegerOverflow);
+                let inst = Inst::trap_if(CC::L, TrapCode::INTEGER_OVERFLOW);
                 inst.emit(sink, info, state);
             }
 
@@ -4257,11 +4384,11 @@ pub(crate) fn emit(
 ///   arguments).
 ///
 /// * Move the return address into its stack slot.
-fn emit_return_call_common_sequence(
+fn emit_return_call_common_sequence<T>(
     sink: &mut MachBuffer<Inst>,
     info: &EmitInfo,
     state: &mut EmitState,
-    call_info: &ReturnCallInfo,
+    call_info: &ReturnCallInfo<T>,
 ) {
     assert!(
         info.flags.preserve_frame_pointers(),

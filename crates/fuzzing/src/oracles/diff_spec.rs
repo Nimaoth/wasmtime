@@ -23,6 +23,8 @@ impl SpecInterpreter {
         config.threads_enabled = false;
         config.bulk_memory_enabled = false;
         config.reference_types_enabled = false;
+        config.tail_call_enabled = false;
+        config.relaxed_simd_enabled = false;
 
         Self
     }
@@ -76,7 +78,7 @@ impl DiffInstance for SpecInstance {
         if let Ok(Global(g)) = export(&self.instance, name) {
             Some(g.into())
         } else {
-            panic!("expected an exported global value at name `{}`", name)
+            panic!("expected an exported global value at name `{name}`")
         }
     }
 
@@ -85,7 +87,7 @@ impl DiffInstance for SpecInstance {
         if let Ok(Memory(m)) = export(&self.instance, name) {
             Some(m)
         } else {
-            panic!("expected an exported memory at name `{}`", name)
+            panic!("expected an exported memory at name `{name}`")
         }
     }
 }
@@ -137,10 +139,15 @@ pub fn setup_ocaml_runtime() {
     wasm_spec_interpreter::setup_ocaml_runtime();
 }
 
-#[test]
-fn smoke() {
-    if !wasm_spec_interpreter::support_compiled_in() {
-        return;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn smoke() {
+        if !wasm_spec_interpreter::support_compiled_in() {
+            return;
+        }
+        crate::oracles::engine::smoke_test_engine(|_, config| Ok(SpecInterpreter::new(config)))
     }
-    crate::oracles::engine::smoke_test_engine(|_, config| Ok(SpecInterpreter::new(config)))
 }

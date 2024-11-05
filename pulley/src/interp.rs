@@ -8,6 +8,7 @@ use alloc::string::ToString;
 use alloc::{vec, vec::Vec};
 use core::fmt;
 use core::mem;
+use core::ops::{Index, IndexMut};
 use core::ptr::{self, NonNull};
 use sptr::Strict;
 
@@ -71,54 +72,54 @@ impl Vm {
         func: NonNull<u8>,
         args: &[Val],
         rets: impl IntoIterator<Item = RegType> + 'a,
-    ) -> Result<impl Iterator<Item = Val> + 'a, *mut u8> {
+    ) -> Result<impl Iterator<Item = Val> + 'a, NonNull<u8>> {
         // NB: make sure this method stays in sync with
-        // `Pbc64MachineDeps::compute_arg_locs`!
+        // `PulleyMachineDeps::compute_arg_locs`!
 
-        let mut x_args = (0..16).map(|x| XReg::unchecked_new(x));
-        let mut f_args = (0..16).map(|f| FReg::unchecked_new(f));
-        let mut v_args = (0..16).map(|v| VReg::unchecked_new(v));
+        let mut x_args = (0..16).map(|x| XReg::new_unchecked(x));
+        let mut f_args = (0..16).map(|f| FReg::new_unchecked(f));
+        let mut v_args = (0..16).map(|v| VReg::new_unchecked(v));
 
         for arg in args {
             match arg {
                 Val::XReg(val) => match x_args.next() {
-                    Some(reg) => self.state.set_x(reg, *val),
+                    Some(reg) => self.state[reg] = *val,
                     None => todo!("stack slots"),
                 },
                 Val::FReg(val) => match f_args.next() {
-                    Some(reg) => self.state.set_f(reg, *val),
+                    Some(reg) => self.state[reg] = *val,
                     None => todo!("stack slots"),
                 },
                 Val::VReg(val) => match v_args.next() {
-                    Some(reg) => self.state.set_v(reg, *val),
+                    Some(reg) => self.state[reg] = *val,
                     None => todo!("stack slots"),
                 },
             }
         }
 
-        self.run(func.as_ptr())?;
+        self.run(func)?;
 
-        let mut x_rets = (0..16).map(|x| XReg::unchecked_new(x));
-        let mut f_rets = (0..16).map(|f| FReg::unchecked_new(f));
-        let mut v_rets = (0..16).map(|v| VReg::unchecked_new(v));
+        let mut x_rets = (0..16).map(|x| XReg::new_unchecked(x));
+        let mut f_rets = (0..16).map(|f| FReg::new_unchecked(f));
+        let mut v_rets = (0..16).map(|v| VReg::new_unchecked(v));
 
         Ok(rets.into_iter().map(move |ty| match ty {
             RegType::XReg => match x_rets.next() {
-                Some(reg) => Val::XReg(self.state.get_x(reg)),
+                Some(reg) => Val::XReg(self.state[reg]),
                 None => todo!("stack slots"),
             },
             RegType::FReg => match f_rets.next() {
-                Some(reg) => Val::FReg(self.state.get_f(reg)),
+                Some(reg) => Val::FReg(self.state[reg]),
                 None => todo!("stack slots"),
             },
             RegType::VReg => match v_rets.next() {
-                Some(reg) => Val::VReg(self.state.get_v(reg)),
+                Some(reg) => Val::VReg(self.state[reg]),
                 None => todo!("stack slots"),
             },
         }))
     }
 
-    unsafe fn run(&mut self, pc: *mut u8) -> Result<(), *mut u8> {
+    unsafe fn run(&mut self, pc: NonNull<u8>) -> Result<(), NonNull<u8>> {
         let mut visitor = InterpreterVisitor {
             state: &mut self.state,
             pc: UnsafeBytecodeStream::new(pc),
@@ -147,23 +148,25 @@ impl Vm {
 
     #[cold]
     #[inline(never)]
-    fn return_to_host(&self) -> Result<(), *mut u8> {
+    fn return_to_host(&self) -> Result<(), NonNull<u8>> {
         Ok(())
     }
 
     #[cold]
     #[inline(never)]
-    fn trap(&self, pc: *mut u8) -> Result<(), *mut u8> {
+    fn trap(&self, pc: NonNull<u8>) -> Result<(), NonNull<u8>> {
         // We are given the VM's PC upon having executed a trap instruction,
         // which is actually pointing to the next instruction after the
         // trap. Back the PC up to point exactly at the trap.
-        let trap_pc = unsafe { pc.byte_sub(ExtendedOpcode::ENCODED_SIZE_OF_TRAP) };
+        let trap_pc = unsafe {
+            NonNull::new_unchecked(pc.as_ptr().byte_sub(ExtendedOpcode::ENCODED_SIZE_OF_TRAP))
+        };
         Err(trap_pc)
     }
 
     #[cold]
     #[inline(never)]
-    fn host_call(&self) -> Result<(), *mut u8> {
+    fn host_call(&self) -> Result<(), NonNull<u8>> {
         todo!()
     }
 }
@@ -524,6 +527,28 @@ impl fmt::Debug for MachineState {
     }
 }
 
+macro_rules! index_reg {
+    ($reg_ty:ty,$value_ty:ty,$field:ident) => {
+        impl Index<$reg_ty> for MachineState {
+            type Output = $value_ty;
+
+            fn index(&self, reg: $reg_ty) -> &Self::Output {
+                &self.$field[reg.index()]
+            }
+        }
+
+        impl IndexMut<$reg_ty> for MachineState {
+            fn index_mut(&mut self, reg: $reg_ty) -> &mut Self::Output {
+                &mut self.$field[reg.index()]
+            }
+        }
+    };
+}
+
+index_reg!(XReg, XRegVal, x_regs);
+index_reg!(FReg, FRegVal, f_regs);
+index_reg!(VReg, VRegVal, v_regs);
+
 impl MachineState {
     fn with_stack(stack: Vec<u8>) -> Self {
         assert!(stack.len() > 0);
@@ -540,101 +565,26 @@ impl MachineState {
         let sp = &mut state.stack[..];
         let sp = sp.as_mut_ptr();
         let sp = unsafe { sp.add(len) };
-        state.set_x(XReg::SP, XRegVal::new_ptr(sp));
-
-        state.set_x(XReg::FP, XRegVal::new_i64(-1));
-        state.set_x(XReg::LR, XRegVal::new_i64(-1));
+        state[XReg::sp] = XRegVal::new_ptr(sp);
+        state[XReg::fp] = XRegVal::new_i64(-1);
+        state[XReg::lr] = XRegVal::new_i64(-1);
 
         state
     }
 
-    /// Get a shared reference to the value of the given `x` register.
-    #[inline(always)]
-    pub fn x(&self, x: XReg) -> &XRegVal {
-        debug_assert!(x.index() < self.x_regs.len());
-        unsafe { self.x_regs.get_unchecked(x.index()) }
+    /// `*sp = val; sp += size_of::<T>()`
+    fn push<T>(&mut self, val: T) {
+        let sp = self[XReg::sp].get_ptr::<T>();
+        unsafe { sp.write_unaligned(val) }
+        self[XReg::sp].set_ptr(sp.wrapping_add(1));
     }
 
-    /// Get an exclusive reference to the value of the given `x` register.
-    #[inline(always)]
-    pub fn x_mut(&mut self, x: XReg) -> &mut XRegVal {
-        debug_assert!(x.index() < self.x_regs.len());
-        unsafe { self.x_regs.get_unchecked_mut(x.index()) }
-    }
-
-    /// Copy the value of the given `x` register.
-    #[inline(always)]
-    pub fn get_x(&self, x: XReg) -> XRegVal {
-        *self.x(x)
-    }
-
-    /// Set the value of the given `x` register.
-    #[inline(always)]
-    pub fn set_x(&mut self, x: XReg, val: XRegVal) {
-        debug_assert!(x.index() < self.x_regs.len());
-        unsafe {
-            *self.x_regs.get_unchecked_mut(x.index()) = val;
-        }
-    }
-
-    /// Get a shared reference to the value of the given `f` register.
-    #[inline(always)]
-    pub fn f(&self, f: FReg) -> &FRegVal {
-        debug_assert!(f.index() < self.f_regs.len());
-        unsafe { self.f_regs.get_unchecked(f.index()) }
-    }
-
-    /// Get an exclusive reference to the value of the given `f` register.
-    #[inline(always)]
-    pub fn f_mut(&mut self, f: FReg) -> &mut FRegVal {
-        debug_assert!(f.index() < self.f_regs.len());
-        unsafe { self.f_regs.get_unchecked_mut(f.index()) }
-    }
-
-    /// Copy the value of the given `f` register.
-    #[inline(always)]
-    pub fn get_f(&self, f: FReg) -> FRegVal {
-        debug_assert!(f.index() < self.f_regs.len());
-        unsafe { *self.f_regs.get_unchecked(f.index()) }
-    }
-
-    /// Set the value of the given `f` register.
-    #[inline(always)]
-    pub fn set_f(&mut self, f: FReg, val: FRegVal) {
-        debug_assert!(f.index() < self.f_regs.len());
-        unsafe {
-            *self.f_regs.get_unchecked_mut(f.index()) = val;
-        }
-    }
-
-    /// Get a shared reference to the value of the given `v` register.
-    #[inline(always)]
-    pub fn v(&self, v: VReg) -> &VRegVal {
-        debug_assert!(v.index() < self.v_regs.len());
-        unsafe { self.v_regs.get_unchecked(v.index()) }
-    }
-
-    /// Get an exclusive reference to the value of the given `v` register.
-    #[inline(always)]
-    pub fn v_mut(&mut self, v: VReg) -> &mut VRegVal {
-        debug_assert!(v.index() < self.v_regs.len());
-        unsafe { self.v_regs.get_unchecked_mut(v.index()) }
-    }
-
-    /// Copy the value of the given `v` register.
-    #[inline(always)]
-    pub fn get_v(&self, v: VReg) -> VRegVal {
-        debug_assert!(v.index() < self.v_regs.len());
-        unsafe { *self.v_regs.get_unchecked(v.index()) }
-    }
-
-    /// Set the value of the given `v` register.
-    #[inline(always)]
-    pub fn set_v(&mut self, v: VReg, val: VRegVal) {
-        debug_assert!(v.index() < self.v_regs.len());
-        unsafe {
-            *self.v_regs.get_unchecked_mut(v.index()) = val;
-        }
+    /// `ret = *sp; sp -= size_of::<T>()`
+    fn pop<T>(&mut self) -> T {
+        let sp = self[XReg::sp].get_ptr::<T>();
+        let val = unsafe { sp.read_unaligned() };
+        self[XReg::sp].set_ptr(sp.wrapping_sub(1));
+        val
     }
 }
 
@@ -672,19 +622,19 @@ impl OpVisitor for InterpreterVisitor<'_> {
     type Return = Continuation;
 
     fn ret(&mut self) -> Self::Return {
-        if self.state.x(XReg::LR).get_u64() == u64::MAX {
+        if self.state[XReg::lr].get_u64() == u64::MAX {
             Continuation::ReturnToHost
         } else {
-            let return_addr = self.state.x(XReg::LR).get_ptr();
-            self.pc = unsafe { UnsafeBytecodeStream::new(return_addr) };
+            let return_addr = self.state[XReg::lr].get_ptr();
+            self.pc = unsafe { UnsafeBytecodeStream::new(NonNull::new_unchecked(return_addr)) };
             // log::trace!("returning to {return_addr:#p}");
             Continuation::Continue
         }
     }
 
     fn call(&mut self, offset: PcRelOffset) -> Self::Return {
-        let return_addr = u64::try_from(self.pc.as_ptr() as usize).unwrap();
-        self.state.x_mut(XReg::LR).set_u64(return_addr);
+        let return_addr = self.pc.as_ptr();
+        self.state[XReg::lr].set_ptr(return_addr.as_ptr());
         self.pc_rel_jump(offset, 5)
     }
 
@@ -693,7 +643,7 @@ impl OpVisitor for InterpreterVisitor<'_> {
     }
 
     fn br_if(&mut self, cond: XReg, offset: PcRelOffset) -> Self::Return {
-        let cond = self.state.x(cond).get_u64();
+        let cond = self.state[cond].get_u64();
         if cond != 0 {
             self.pc_rel_jump(offset, 6)
         } else {
@@ -702,7 +652,7 @@ impl OpVisitor for InterpreterVisitor<'_> {
     }
 
     fn br_if_not(&mut self, cond: XReg, offset: PcRelOffset) -> Self::Return {
-        let cond = self.state.x(cond).get_u64();
+        let cond = self.state[cond].get_u64();
         if cond == 0 {
             self.pc_rel_jump(offset, 6)
         } else {
@@ -711,8 +661,8 @@ impl OpVisitor for InterpreterVisitor<'_> {
     }
 
     fn br_if_xeq32(&mut self, a: XReg, b: XReg, offset: PcRelOffset) -> Self::Return {
-        let a = self.state.x(a).get_u32();
-        let b = self.state.x(b).get_u32();
+        let a = self.state[a].get_u32();
+        let b = self.state[b].get_u32();
         if a == b {
             self.pc_rel_jump(offset, 7)
         } else {
@@ -721,8 +671,8 @@ impl OpVisitor for InterpreterVisitor<'_> {
     }
 
     fn br_if_xneq32(&mut self, a: XReg, b: XReg, offset: PcRelOffset) -> Self::Return {
-        let a = self.state.x(a).get_u32();
-        let b = self.state.x(b).get_u32();
+        let a = self.state[a].get_u32();
+        let b = self.state[b].get_u32();
         if a != b {
             self.pc_rel_jump(offset, 7)
         } else {
@@ -731,8 +681,8 @@ impl OpVisitor for InterpreterVisitor<'_> {
     }
 
     fn br_if_xslt32(&mut self, a: XReg, b: XReg, offset: PcRelOffset) -> Self::Return {
-        let a = self.state.x(a).get_i32();
-        let b = self.state.x(b).get_i32();
+        let a = self.state[a].get_i32();
+        let b = self.state[b].get_i32();
         if a < b {
             self.pc_rel_jump(offset, 7)
         } else {
@@ -741,8 +691,8 @@ impl OpVisitor for InterpreterVisitor<'_> {
     }
 
     fn br_if_xslteq32(&mut self, a: XReg, b: XReg, offset: PcRelOffset) -> Self::Return {
-        let a = self.state.x(a).get_i32();
-        let b = self.state.x(b).get_i32();
+        let a = self.state[a].get_i32();
+        let b = self.state[b].get_i32();
         if a <= b {
             self.pc_rel_jump(offset, 7)
         } else {
@@ -751,8 +701,8 @@ impl OpVisitor for InterpreterVisitor<'_> {
     }
 
     fn br_if_xult32(&mut self, a: XReg, b: XReg, offset: PcRelOffset) -> Self::Return {
-        let a = self.state.x(a).get_u32();
-        let b = self.state.x(b).get_u32();
+        let a = self.state[a].get_u32();
+        let b = self.state[b].get_u32();
         if a < b {
             self.pc_rel_jump(offset, 7)
         } else {
@@ -761,8 +711,68 @@ impl OpVisitor for InterpreterVisitor<'_> {
     }
 
     fn br_if_xulteq32(&mut self, a: XReg, b: XReg, offset: PcRelOffset) -> Self::Return {
-        let a = self.state.x(a).get_u32();
-        let b = self.state.x(b).get_u32();
+        let a = self.state[a].get_u32();
+        let b = self.state[b].get_u32();
+        if a <= b {
+            self.pc_rel_jump(offset, 7)
+        } else {
+            Continuation::Continue
+        }
+    }
+
+    fn br_if_xeq64(&mut self, a: XReg, b: XReg, offset: PcRelOffset) -> Self::Return {
+        let a = self.state[a].get_u64();
+        let b = self.state[b].get_u64();
+        if a == b {
+            self.pc_rel_jump(offset, 7)
+        } else {
+            Continuation::Continue
+        }
+    }
+
+    fn br_if_xneq64(&mut self, a: XReg, b: XReg, offset: PcRelOffset) -> Self::Return {
+        let a = self.state[a].get_u64();
+        let b = self.state[b].get_u64();
+        if a != b {
+            self.pc_rel_jump(offset, 7)
+        } else {
+            Continuation::Continue
+        }
+    }
+
+    fn br_if_xslt64(&mut self, a: XReg, b: XReg, offset: PcRelOffset) -> Self::Return {
+        let a = self.state[a].get_i64();
+        let b = self.state[b].get_i64();
+        if a < b {
+            self.pc_rel_jump(offset, 7)
+        } else {
+            Continuation::Continue
+        }
+    }
+
+    fn br_if_xslteq64(&mut self, a: XReg, b: XReg, offset: PcRelOffset) -> Self::Return {
+        let a = self.state[a].get_i64();
+        let b = self.state[b].get_i64();
+        if a <= b {
+            self.pc_rel_jump(offset, 7)
+        } else {
+            Continuation::Continue
+        }
+    }
+
+    fn br_if_xult64(&mut self, a: XReg, b: XReg, offset: PcRelOffset) -> Self::Return {
+        let a = self.state[a].get_u64();
+        let b = self.state[b].get_u64();
+        if a < b {
+            self.pc_rel_jump(offset, 7)
+        } else {
+            Continuation::Continue
+        }
+    }
+
+    fn br_if_xulteq64(&mut self, a: XReg, b: XReg, offset: PcRelOffset) -> Self::Return {
+        let a = self.state[a].get_u64();
+        let b = self.state[b].get_u64();
         if a <= b {
             self.pc_rel_jump(offset, 7)
         } else {
@@ -771,201 +781,231 @@ impl OpVisitor for InterpreterVisitor<'_> {
     }
 
     fn xmov(&mut self, dst: XReg, src: XReg) -> Self::Return {
-        let val = self.state.get_x(src);
-        self.state.set_x(dst, val);
+        let val = self.state[src];
+        self.state[dst] = val;
         Continuation::Continue
     }
 
     fn fmov(&mut self, dst: FReg, src: FReg) -> Self::Return {
-        let val = self.state.get_f(src);
-        self.state.set_f(dst, val);
+        let val = self.state[src];
+        self.state[dst] = val;
         Continuation::Continue
     }
 
     fn vmov(&mut self, dst: VReg, src: VReg) -> Self::Return {
-        let val = self.state.get_v(src);
-        self.state.set_v(dst, val);
+        let val = self.state[src];
+        self.state[dst] = val;
         Continuation::Continue
     }
 
-    fn xconst8(&mut self, dst: XReg, imm: u8) -> Self::Return {
-        self.state.x_mut(dst).set_u64(u64::from(imm));
+    fn xconst8(&mut self, dst: XReg, imm: i8) -> Self::Return {
+        self.state[dst].set_i64(i64::from(imm));
         Continuation::Continue
     }
 
-    fn xconst16(&mut self, dst: XReg, imm: u16) -> Self::Return {
-        self.state.x_mut(dst).set_u64(u64::from(imm));
+    fn xconst16(&mut self, dst: XReg, imm: i16) -> Self::Return {
+        self.state[dst].set_i64(i64::from(imm));
         Continuation::Continue
     }
 
-    fn xconst32(&mut self, dst: XReg, imm: u32) -> Self::Return {
-        self.state.x_mut(dst).set_u64(u64::from(imm));
+    fn xconst32(&mut self, dst: XReg, imm: i32) -> Self::Return {
+        self.state[dst].set_i64(i64::from(imm));
         Continuation::Continue
     }
 
-    fn xconst64(&mut self, dst: XReg, imm: u64) -> Self::Return {
-        self.state.x_mut(dst).set_u64(imm);
+    fn xconst64(&mut self, dst: XReg, imm: i64) -> Self::Return {
+        self.state[dst].set_i64(imm);
         Continuation::Continue
     }
 
-    fn xadd32(&mut self, dst: XReg, src1: XReg, src2: XReg) -> Self::Return {
-        let a = self.state.x(src1).get_u32();
-        let b = self.state.x(src2).get_u32();
-        self.state.x_mut(dst).set_u32(a.wrapping_add(b));
+    fn xadd32(&mut self, operands: BinaryOperands<XReg>) -> Self::Return {
+        let a = self.state[operands.src1].get_u32();
+        let b = self.state[operands.src2].get_u32();
+        self.state[operands.dst].set_u32(a.wrapping_add(b));
         Continuation::Continue
     }
 
-    fn xadd64(&mut self, dst: XReg, src1: XReg, src2: XReg) -> Self::Return {
-        let a = self.state.x(src1).get_u64();
-        let b = self.state.x(src2).get_u64();
-        self.state.x_mut(dst).set_u64(a.wrapping_add(b));
+    fn xadd64(&mut self, operands: BinaryOperands<XReg>) -> Self::Return {
+        let a = self.state[operands.src1].get_u64();
+        let b = self.state[operands.src2].get_u64();
+        self.state[operands.dst].set_u64(a.wrapping_add(b));
         Continuation::Continue
     }
 
-    fn xeq64(&mut self, dst: XReg, src1: XReg, src2: XReg) -> Self::Return {
-        let a = self.state.x(src1).get_u64();
-        let b = self.state.x(src2).get_u64();
-        self.state.x_mut(dst).set_u64(u64::from(a == b));
+    fn xeq64(&mut self, operands: BinaryOperands<XReg>) -> Self::Return {
+        let a = self.state[operands.src1].get_u64();
+        let b = self.state[operands.src2].get_u64();
+        self.state[operands.dst].set_u64(u64::from(a == b));
         Continuation::Continue
     }
 
-    fn xneq64(&mut self, dst: XReg, src1: XReg, src2: XReg) -> Self::Return {
-        let a = self.state.x(src1).get_u64();
-        let b = self.state.x(src2).get_u64();
-        self.state.x_mut(dst).set_u64(u64::from(a != b));
+    fn xneq64(&mut self, operands: BinaryOperands<XReg>) -> Self::Return {
+        let a = self.state[operands.src1].get_u64();
+        let b = self.state[operands.src2].get_u64();
+        self.state[operands.dst].set_u64(u64::from(a != b));
         Continuation::Continue
     }
 
-    fn xslt64(&mut self, dst: XReg, src1: XReg, src2: XReg) -> Self::Return {
-        let a = self.state.x(src1).get_i64();
-        let b = self.state.x(src2).get_i64();
-        self.state.x_mut(dst).set_u64(u64::from(a < b));
+    fn xslt64(&mut self, operands: BinaryOperands<XReg>) -> Self::Return {
+        let a = self.state[operands.src1].get_i64();
+        let b = self.state[operands.src2].get_i64();
+        self.state[operands.dst].set_u64(u64::from(a < b));
         Continuation::Continue
     }
 
-    fn xslteq64(&mut self, dst: XReg, src1: XReg, src2: XReg) -> Self::Return {
-        let a = self.state.x(src1).get_i64();
-        let b = self.state.x(src2).get_i64();
-        self.state.x_mut(dst).set_u64(u64::from(a <= b));
+    fn xslteq64(&mut self, operands: BinaryOperands<XReg>) -> Self::Return {
+        let a = self.state[operands.src1].get_i64();
+        let b = self.state[operands.src2].get_i64();
+        self.state[operands.dst].set_u64(u64::from(a <= b));
         Continuation::Continue
     }
 
-    fn xult64(&mut self, dst: XReg, src1: XReg, src2: XReg) -> Self::Return {
-        let a = self.state.x(src1).get_u64();
-        let b = self.state.x(src2).get_u64();
-        self.state.x_mut(dst).set_u64(u64::from(a < b));
+    fn xult64(&mut self, operands: BinaryOperands<XReg>) -> Self::Return {
+        let a = self.state[operands.src1].get_u64();
+        let b = self.state[operands.src2].get_u64();
+        self.state[operands.dst].set_u64(u64::from(a < b));
         Continuation::Continue
     }
 
-    fn xulteq64(&mut self, dst: XReg, src1: XReg, src2: XReg) -> Self::Return {
-        let a = self.state.x(src1).get_u64();
-        let b = self.state.x(src2).get_u64();
-        self.state.x_mut(dst).set_u64(u64::from(a <= b));
+    fn xulteq64(&mut self, operands: BinaryOperands<XReg>) -> Self::Return {
+        let a = self.state[operands.src1].get_u64();
+        let b = self.state[operands.src2].get_u64();
+        self.state[operands.dst].set_u64(u64::from(a <= b));
         Continuation::Continue
     }
 
-    fn xeq32(&mut self, dst: XReg, src1: XReg, src2: XReg) -> Self::Return {
-        let a = self.state.x(src1).get_u32();
-        let b = self.state.x(src2).get_u32();
-        self.state.x_mut(dst).set_u64(u64::from(a == b));
+    fn xeq32(&mut self, operands: BinaryOperands<XReg>) -> Self::Return {
+        let a = self.state[operands.src1].get_u32();
+        let b = self.state[operands.src2].get_u32();
+        self.state[operands.dst].set_u64(u64::from(a == b));
         Continuation::Continue
     }
 
-    fn xneq32(&mut self, dst: XReg, src1: XReg, src2: XReg) -> Self::Return {
-        let a = self.state.x(src1).get_u32();
-        let b = self.state.x(src2).get_u32();
-        self.state.x_mut(dst).set_u64(u64::from(a != b));
+    fn xneq32(&mut self, operands: BinaryOperands<XReg>) -> Self::Return {
+        let a = self.state[operands.src1].get_u32();
+        let b = self.state[operands.src2].get_u32();
+        self.state[operands.dst].set_u64(u64::from(a != b));
         Continuation::Continue
     }
 
-    fn xslt32(&mut self, dst: XReg, src1: XReg, src2: XReg) -> Self::Return {
-        let a = self.state.x(src1).get_i32();
-        let b = self.state.x(src2).get_i32();
-        self.state.x_mut(dst).set_u64(u64::from(a < b));
+    fn xslt32(&mut self, operands: BinaryOperands<XReg>) -> Self::Return {
+        let a = self.state[operands.src1].get_i32();
+        let b = self.state[operands.src2].get_i32();
+        self.state[operands.dst].set_u64(u64::from(a < b));
         Continuation::Continue
     }
 
-    fn xslteq32(&mut self, dst: XReg, src1: XReg, src2: XReg) -> Self::Return {
-        let a = self.state.x(src1).get_i32();
-        let b = self.state.x(src2).get_i32();
-        self.state.x_mut(dst).set_u64(u64::from(a <= b));
+    fn xslteq32(&mut self, operands: BinaryOperands<XReg>) -> Self::Return {
+        let a = self.state[operands.src1].get_i32();
+        let b = self.state[operands.src2].get_i32();
+        self.state[operands.dst].set_u64(u64::from(a <= b));
         Continuation::Continue
     }
 
-    fn xult32(&mut self, dst: XReg, src1: XReg, src2: XReg) -> Self::Return {
-        let a = self.state.x(src1).get_u32();
-        let b = self.state.x(src2).get_u32();
-        self.state.x_mut(dst).set_u64(u64::from(a < b));
+    fn xult32(&mut self, operands: BinaryOperands<XReg>) -> Self::Return {
+        let a = self.state[operands.src1].get_u32();
+        let b = self.state[operands.src2].get_u32();
+        self.state[operands.dst].set_u64(u64::from(a < b));
         Continuation::Continue
     }
 
-    fn xulteq32(&mut self, dst: XReg, src1: XReg, src2: XReg) -> Self::Return {
-        let a = self.state.x(src1).get_u32();
-        let b = self.state.x(src2).get_u32();
-        self.state.x_mut(dst).set_u64(u64::from(a <= b));
+    fn xulteq32(&mut self, operands: BinaryOperands<XReg>) -> Self::Return {
+        let a = self.state[operands.src1].get_u32();
+        let b = self.state[operands.src2].get_u32();
+        self.state[operands.dst].set_u64(u64::from(a <= b));
         Continuation::Continue
     }
 
     fn load32_u(&mut self, dst: XReg, ptr: XReg) -> Self::Return {
-        let ptr = self.state.x(ptr).get_ptr::<u32>();
+        let ptr = self.state[ptr].get_ptr::<u32>();
         let val = unsafe { ptr::read_unaligned(ptr) };
-        self.state.x_mut(dst).set_u64(u64::from(val));
+        self.state[dst].set_u64(u64::from(val));
         Continuation::Continue
     }
 
     fn load32_s(&mut self, dst: XReg, ptr: XReg) -> Self::Return {
-        let ptr = self.state.x(ptr).get_ptr::<i32>();
+        let ptr = self.state[ptr].get_ptr::<i32>();
         let val = unsafe { ptr::read_unaligned(ptr) };
-        self.state.x_mut(dst).set_i64(i64::from(val));
+        self.state[dst].set_i64(i64::from(val));
         Continuation::Continue
     }
 
     fn load64(&mut self, dst: XReg, ptr: XReg) -> Self::Return {
-        let ptr = self.state.x(ptr).get_ptr::<u64>();
+        let ptr = self.state[ptr].get_ptr::<u64>();
         let val = unsafe { ptr::read_unaligned(ptr) };
-        self.state.x_mut(dst).set_u64(val);
+        self.state[dst].set_u64(val);
         Continuation::Continue
     }
 
     fn load32_u_offset8(&mut self, dst: XReg, ptr: XReg, offset: i8) -> Self::Return {
         let val = unsafe {
-            self.state
-                .x(ptr)
+            self.state[ptr]
                 .get_ptr::<u32>()
                 .byte_offset(offset.into())
                 .read_unaligned()
         };
-        self.state.x_mut(dst).set_u64(u64::from(val));
+        self.state[dst].set_u64(u64::from(val));
         Continuation::Continue
     }
 
     fn load32_s_offset8(&mut self, dst: XReg, ptr: XReg, offset: i8) -> Self::Return {
         let val = unsafe {
-            self.state
-                .x(ptr)
+            self.state[ptr]
                 .get_ptr::<i32>()
                 .byte_offset(offset.into())
                 .read_unaligned()
         };
-        self.state.x_mut(dst).set_i64(i64::from(val));
+        self.state[dst].set_i64(i64::from(val));
+        Continuation::Continue
+    }
+
+    fn load32_u_offset64(&mut self, dst: XReg, ptr: XReg, offset: i64) -> Self::Return {
+        let val = unsafe {
+            self.state[ptr]
+                .get_ptr::<u32>()
+                .byte_offset(offset as isize)
+                .read_unaligned()
+        };
+        self.state[dst].set_u64(u64::from(val));
+        Continuation::Continue
+    }
+
+    fn load32_s_offset64(&mut self, dst: XReg, ptr: XReg, offset: i64) -> Self::Return {
+        let val = unsafe {
+            self.state[ptr]
+                .get_ptr::<i32>()
+                .byte_offset(offset as isize)
+                .read_unaligned()
+        };
+        self.state[dst].set_i64(i64::from(val));
         Continuation::Continue
     }
 
     fn load64_offset8(&mut self, dst: XReg, ptr: XReg, offset: i8) -> Self::Return {
         let val = unsafe {
-            self.state
-                .x(ptr)
+            self.state[ptr]
                 .get_ptr::<u64>()
                 .byte_offset(offset.into())
                 .read_unaligned()
         };
-        self.state.x_mut(dst).set_u64(val);
+        self.state[dst].set_u64(val);
+        Continuation::Continue
+    }
+
+    fn load64_offset64(&mut self, dst: XReg, ptr: XReg, offset: i64) -> Self::Return {
+        let val = unsafe {
+            self.state[ptr]
+                .get_ptr::<u64>()
+                .byte_offset(offset as isize)
+                .read_unaligned()
+        };
+        self.state[dst].set_u64(val);
         Continuation::Continue
     }
 
     fn store32(&mut self, ptr: XReg, src: XReg) -> Self::Return {
-        let ptr = self.state.x(ptr).get_ptr::<u32>();
-        let val = self.state.x(src).get_u32();
+        let ptr = self.state[ptr].get_ptr::<u32>();
+        let val = self.state[src].get_u32();
         unsafe {
             ptr::write_unaligned(ptr, val);
         }
@@ -973,8 +1013,8 @@ impl OpVisitor for InterpreterVisitor<'_> {
     }
 
     fn store64(&mut self, ptr: XReg, src: XReg) -> Self::Return {
-        let ptr = self.state.x(ptr).get_ptr::<u64>();
-        let val = self.state.x(src).get_u64();
+        let ptr = self.state[ptr].get_ptr::<u64>();
+        let val = self.state[src].get_u64();
         unsafe {
             ptr::write_unaligned(ptr, val);
         }
@@ -982,10 +1022,9 @@ impl OpVisitor for InterpreterVisitor<'_> {
     }
 
     fn store32_offset8(&mut self, ptr: XReg, offset: i8, src: XReg) -> Self::Return {
-        let val = self.state.x(src).get_u32();
+        let val = self.state[src].get_u32();
         unsafe {
-            self.state
-                .x(ptr)
+            self.state[ptr]
                 .get_ptr::<u32>()
                 .byte_offset(offset.into())
                 .write_unaligned(val);
@@ -994,10 +1033,9 @@ impl OpVisitor for InterpreterVisitor<'_> {
     }
 
     fn store64_offset8(&mut self, ptr: XReg, offset: i8, src: XReg) -> Self::Return {
-        let val = self.state.x(src).get_u64();
+        let val = self.state[src].get_u64();
         unsafe {
-            self.state
-                .x(ptr)
+            self.state[ptr]
                 .get_ptr::<u64>()
                 .byte_offset(offset.into())
                 .write_unaligned(val);
@@ -1005,35 +1043,117 @@ impl OpVisitor for InterpreterVisitor<'_> {
         Continuation::Continue
     }
 
+    fn store32_offset64(&mut self, ptr: XReg, offset: i64, src: XReg) -> Self::Return {
+        let val = self.state[src].get_u32();
+        unsafe {
+            self.state[ptr]
+                .get_ptr::<u32>()
+                .byte_offset(offset as isize)
+                .write_unaligned(val);
+        }
+        Continuation::Continue
+    }
+
+    fn store64_offset64(&mut self, ptr: XReg, offset: i64, src: XReg) -> Self::Return {
+        let val = self.state[src].get_u64();
+        unsafe {
+            self.state[ptr]
+                .get_ptr::<u64>()
+                .byte_offset(offset as isize)
+                .write_unaligned(val);
+        }
+        Continuation::Continue
+    }
+
+    fn xpush32(&mut self, src: XReg) -> Self::Return {
+        self.state.push(self.state[src].get_u32());
+        Continuation::Continue
+    }
+
+    fn xpush32_many(&mut self, srcs: RegSet<XReg>) -> Self::Return {
+        for src in srcs {
+            self.xpush32(src);
+        }
+        Continuation::Continue
+    }
+
+    fn xpush64(&mut self, src: XReg) -> Self::Return {
+        self.state.push(self.state[src].get_u64());
+        Continuation::Continue
+    }
+
+    fn xpush64_many(&mut self, srcs: RegSet<XReg>) -> Self::Return {
+        for src in srcs {
+            self.xpush64(src);
+        }
+        Continuation::Continue
+    }
+
+    fn xpop32(&mut self, dst: XReg) -> Self::Return {
+        let val = self.state.pop();
+        self.state[dst].set_u32(val);
+        Continuation::Continue
+    }
+
+    fn xpop32_many(&mut self, dsts: RegSet<XReg>) -> Self::Return {
+        for dst in dsts.into_iter().rev() {
+            self.xpop32(dst);
+        }
+        Continuation::Continue
+    }
+
+    fn xpop64(&mut self, dst: XReg) -> Self::Return {
+        let val = self.state.pop();
+        self.state[dst].set_u64(val);
+        Continuation::Continue
+    }
+
+    fn xpop64_many(&mut self, dsts: RegSet<XReg>) -> Self::Return {
+        for dst in dsts.into_iter().rev() {
+            self.xpop64(dst);
+        }
+        Continuation::Continue
+    }
+
+    /// `push lr; push fp; fp = sp`
+    fn push_frame(&mut self) -> Self::Return {
+        self.state.push(self.state[XReg::lr].get_ptr::<u8>());
+        self.state.push(self.state[XReg::fp].get_ptr::<u8>());
+        self.state[XReg::fp] = self.state[XReg::sp];
+        Continuation::Continue
+    }
+
+    /// `sp = fp; pop fp; pop lr`
+    fn pop_frame(&mut self) -> Self::Return {
+        self.state[XReg::sp] = self.state[XReg::fp];
+        let fp = self.state.pop();
+        let lr = self.state.pop();
+        self.state[XReg::fp].set_ptr::<u8>(fp);
+        self.state[XReg::lr].set_ptr::<u8>(lr);
+        Continuation::Continue
+    }
+
     fn bitcast_int_from_float_32(&mut self, dst: XReg, src: FReg) -> Self::Return {
-        let val = self.state.f(src).get_f32();
-        self.state
-            .x_mut(dst)
-            .set_u64(u32::from_ne_bytes(val.to_ne_bytes()).into());
+        let val = self.state[src].get_f32();
+        self.state[dst].set_u64(u32::from_ne_bytes(val.to_ne_bytes()).into());
         Continuation::Continue
     }
 
     fn bitcast_int_from_float_64(&mut self, dst: XReg, src: FReg) -> Self::Return {
-        let val = self.state.f(src).get_f64();
-        self.state
-            .x_mut(dst)
-            .set_u64(u64::from_ne_bytes(val.to_ne_bytes()));
+        let val = self.state[src].get_f64();
+        self.state[dst].set_u64(u64::from_ne_bytes(val.to_ne_bytes()));
         Continuation::Continue
     }
 
     fn bitcast_float_from_int_32(&mut self, dst: FReg, src: XReg) -> Self::Return {
-        let val = self.state.x(src).get_u32();
-        self.state
-            .f_mut(dst)
-            .set_f32(f32::from_ne_bytes(val.to_ne_bytes()));
+        let val = self.state[src].get_u32();
+        self.state[dst].set_f32(f32::from_ne_bytes(val.to_ne_bytes()));
         Continuation::Continue
     }
 
     fn bitcast_float_from_int_64(&mut self, dst: FReg, src: XReg) -> Self::Return {
-        let val = self.state.x(src).get_u64();
-        self.state
-            .f_mut(dst)
-            .set_f64(f64::from_ne_bytes(val.to_ne_bytes()));
+        let val = self.state[src].get_u64();
+        self.state[dst].set_f64(f64::from_ne_bytes(val.to_ne_bytes()));
         Continuation::Continue
     }
 }
@@ -1048,8 +1168,8 @@ impl ExtendedOpVisitor for InterpreterVisitor<'_> {
     }
 
     fn get_sp(&mut self, dst: XReg) -> Self::Return {
-        let sp = self.state.x(XReg::SP).get_u64();
-        self.state.x_mut(dst).set_u64(sp);
+        let sp = self.state[XReg::sp].get_u64();
+        self.state[dst].set_u64(sp);
         Continuation::Continue
     }
 }

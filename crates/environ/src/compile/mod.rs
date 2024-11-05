@@ -263,7 +263,7 @@ pub trait Compiler: Send + Sync {
     /// 1. First, the index within `funcs` that is being resolved,
     ///
     /// 2. and next the `RelocationTarget` which is the relocation target to
-    /// resolve.
+    ///    resolve.
     ///
     /// The return value is an index within `funcs` that the relocation points
     /// to.
@@ -293,6 +293,10 @@ pub trait Compiler: Send + Sync {
                 Aarch64(_) => Architecture::Aarch64,
                 S390x => Architecture::S390x,
                 Riscv64(_) => Architecture::Riscv64,
+                // XXX: the `object` crate won't successfully build an object
+                // with relocations and such if it doesn't know the
+                // architecture, so just pretend we are riscv64. Yolo!
+                Pulley32 | Pulley64 => Architecture::Riscv64,
                 architecture => {
                     anyhow::bail!("target architecture {:?} is unsupported", architecture,);
                 }

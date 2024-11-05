@@ -8,11 +8,13 @@ mod disabled;
 #[cfg(not(feature = "gc"))]
 pub use disabled::*;
 
+mod func_ref;
 mod gc_ref;
 mod gc_runtime;
 mod host_data;
 mod i31;
 
+pub use func_ref::*;
 pub use gc_ref::*;
 pub use gc_runtime::*;
 pub use host_data::*;
@@ -20,22 +22,10 @@ pub use i31::*;
 
 use crate::prelude::*;
 use crate::runtime::vm::GcHeapAllocationIndex;
+use core::alloc::Layout;
 use core::ptr;
 use core::{any::Any, num::NonZeroUsize};
-use wasmtime_environ::{StackMap, VMGcKind, VMSharedTypeIndex};
-
-/// Used by the runtime to lookup information about a module given a
-/// program counter value.
-pub trait ModuleInfoLookup {
-    /// Lookup the module information from a program counter value.
-    fn lookup(&self, pc: usize) -> Option<&dyn ModuleInfo>;
-}
-
-/// Used by the runtime to query module information.
-pub trait ModuleInfo {
-    /// Lookup the stack map at a program counter value.
-    fn lookup_stack_map(&self, pc: usize) -> Option<&StackMap>;
-}
+use wasmtime_environ::{GcArrayLayout, GcStructLayout, VMGcKind, VMSharedTypeIndex};
 
 /// GC-related data that is one-to-one with a `wasmtime::Store`.
 ///
@@ -54,16 +44,21 @@ pub struct GcStore {
 
     /// The `externref` host data table for this GC heap.
     pub host_data_table: ExternRefHostDataTable,
+
+    /// The function-references table for this GC heap.
+    pub func_ref_table: FuncRefTable,
 }
 
 impl GcStore {
     /// Create a new `GcStore`.
     pub fn new(allocation_index: GcHeapAllocationIndex, gc_heap: Box<dyn GcHeap>) -> Self {
         let host_data_table = ExternRefHostDataTable::default();
+        let func_ref_table = FuncRefTable::default();
         Self {
             allocation_index,
             gc_heap,
             host_data_table,
+            func_ref_table,
         }
     }
 
@@ -128,6 +123,7 @@ impl GcStore {
     /// Hook to call whenever a GC reference is about to be exposed to Wasm.
     pub fn expose_gc_ref_to_wasm(&mut self, gc_ref: VMGcRef) {
         if !gc_ref.is_i31() {
+            log::trace!("exposing GC ref to Wasm: {gc_ref:p}");
             self.gc_heap.expose_gc_ref_to_wasm(gc_ref);
         }
     }
@@ -149,6 +145,7 @@ impl GcStore {
     ) -> Result<Result<VMExternRef, Box<dyn Any + Send + Sync>>> {
         let host_data_id = self.host_data_table.alloc(value);
         match self.gc_heap.alloc_externref(host_data_id)? {
+            #[cfg_attr(not(feature = "gc"), allow(unreachable_patterns))]
             Some(x) => Ok(Ok(x)),
             None => Ok(Err(self.host_data_table.dealloc(host_data_id))),
         }
@@ -177,6 +174,11 @@ impl GcStore {
         self.host_data_table.get_mut(host_data_id)
     }
 
+    /// Allocate a raw object with the given header and layout.
+    pub fn alloc_raw(&mut self, header: VMGcHeader, layout: Layout) -> Result<Option<VMGcRef>> {
+        self.gc_heap.alloc_raw(header, layout)
+    }
+
     /// Allocate an uninitialized struct with the given type index and layout.
     ///
     /// This does NOT check that the index is currently allocated in the types
@@ -196,16 +198,36 @@ impl GcStore {
         self.gc_heap.dealloc_uninit_struct(structref);
     }
 
-    /// Get the data for the given struct reference.
+    /// Get the data for the given object reference.
     ///
     /// Panics when the structref and its size is out of the GC heap bounds.
+    pub fn gc_object_data(&mut self, gc_ref: &VMGcRef) -> VMGcObjectDataMut<'_> {
+        self.gc_heap.gc_object_data(gc_ref)
+    }
+
+    /// Allocate an uninitialized array with the given type index.
     ///
-    /// This does NOT check for mismatches where the referenced struct is not
-    /// actually `size` bytes large. Failure to pass the right `size` is memory
-    /// safe, but will lead to general incorrectness such as panics and wrong
-    /// results.
-    pub fn struct_data(&mut self, structref: &VMStructRef, size: u32) -> VMStructDataMut<'_> {
-        self.gc_heap.struct_data(structref, size)
+    /// This does NOT check that the index is currently allocated in the types
+    /// registry or that the layout matches the index's type. Failure to uphold
+    /// those invariants is memory safe, but will lead to general incorrectness
+    /// such as panics and wrong results.
+    pub fn alloc_uninit_array(
+        &mut self,
+        ty: VMSharedTypeIndex,
+        len: u32,
+        layout: &GcArrayLayout,
+    ) -> Result<Option<VMArrayRef>> {
+        self.gc_heap.alloc_uninit_array(ty, len, layout)
+    }
+
+    /// Deallocate an uninitialized array.
+    pub fn dealloc_uninit_array(&mut self, arrayref: VMArrayRef) {
+        self.gc_heap.dealloc_uninit_array(arrayref);
+    }
+
+    /// Get the length of the given array.
+    pub fn array_len(&self, arrayref: &VMArrayRef) -> u32 {
+        self.gc_heap.array_len(arrayref)
     }
 }
 
@@ -213,91 +235,111 @@ impl GcStore {
 /// time or dynamically due to it being turned off in the `wasmtime::Config`).
 pub fn disabled_gc_heap() -> Box<dyn GcHeap> {
     return Box::new(DisabledGcHeap);
+}
 
-    struct DisabledGcHeap;
+pub(crate) struct DisabledGcHeap;
 
-    unsafe impl GcHeap for DisabledGcHeap {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-        fn as_any_mut(&mut self) -> &mut dyn Any {
-            self
-        }
-        fn enter_no_gc_scope(&mut self) {}
-        fn exit_no_gc_scope(&mut self) {}
-        fn header(&self, _gc_ref: &VMGcRef) -> &VMGcHeader {
-            unreachable!()
-        }
-        fn clone_gc_ref(&mut self, _gc_ref: &VMGcRef) -> VMGcRef {
-            unreachable!()
-        }
-        fn write_gc_ref(
-            &mut self,
-            _host_data_table: &mut ExternRefHostDataTable,
-            _destination: &mut Option<VMGcRef>,
-            _source: Option<&VMGcRef>,
-        ) {
-            unreachable!()
-        }
-        fn expose_gc_ref_to_wasm(&mut self, _gc_ref: VMGcRef) {
-            unreachable!()
-        }
-        fn need_gc_before_entering_wasm(&self, _num_gc_refs: NonZeroUsize) -> bool {
-            unreachable!()
-        }
-        fn alloc_externref(
-            &mut self,
-            _host_data: ExternRefHostDataId,
-        ) -> Result<Option<VMExternRef>> {
-            bail!(
-                "GC support disabled either in the `Config` or at compile time \
-                 because the `gc` cargo feature was not enabled"
-            )
-        }
-        fn externref_host_data(&self, _externref: &VMExternRef) -> ExternRefHostDataId {
-            unreachable!()
-        }
-        fn alloc_uninit_struct(
-            &mut self,
-            _ty: wasmtime_environ::VMSharedTypeIndex,
-            _layout: &GcStructLayout,
-        ) -> Result<Option<VMStructRef>> {
-            bail!(
-                "GC support disabled either in the `Config` or at compile time \
-                 because the `gc` cargo feature was not enabled"
-            )
-        }
-        fn dealloc_uninit_struct(&mut self, _structref: VMStructRef) {
-            unreachable!()
-        }
-        fn struct_data(&mut self, _structref: &VMStructRef, _size: u32) -> VMStructDataMut<'_> {
-            unreachable!()
-        }
-        fn gc<'a>(
-            &'a mut self,
-            _roots: GcRootsIter<'a>,
-            _host_data_table: &'a mut ExternRefHostDataTable,
-        ) -> Box<dyn GarbageCollection<'a> + 'a> {
-            return Box::new(NoGc);
+unsafe impl GcHeap for DisabledGcHeap {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+    fn enter_no_gc_scope(&mut self) {}
+    fn exit_no_gc_scope(&mut self) {}
+    fn header(&self, _gc_ref: &VMGcRef) -> &VMGcHeader {
+        unreachable!()
+    }
+    fn clone_gc_ref(&mut self, _gc_ref: &VMGcRef) -> VMGcRef {
+        unreachable!()
+    }
+    fn write_gc_ref(
+        &mut self,
+        _host_data_table: &mut ExternRefHostDataTable,
+        _destination: &mut Option<VMGcRef>,
+        _source: Option<&VMGcRef>,
+    ) {
+        unreachable!()
+    }
+    fn expose_gc_ref_to_wasm(&mut self, _gc_ref: VMGcRef) {
+        unreachable!()
+    }
+    fn need_gc_before_entering_wasm(&self, _num_gc_refs: NonZeroUsize) -> bool {
+        unreachable!()
+    }
+    fn alloc_externref(&mut self, _host_data: ExternRefHostDataId) -> Result<Option<VMExternRef>> {
+        bail!(
+            "GC support disabled either in the `Config` or at compile time \
+             because the `gc` cargo feature was not enabled"
+        )
+    }
+    fn externref_host_data(&self, _externref: &VMExternRef) -> ExternRefHostDataId {
+        unreachable!()
+    }
+    fn alloc_raw(&mut self, _header: VMGcHeader, _layout: Layout) -> Result<Option<VMGcRef>> {
+        bail!(
+            "GC support disabled either in the `Config` or at compile time \
+             because the `gc` cargo feature was not enabled"
+        )
+    }
+    fn alloc_uninit_struct(
+        &mut self,
+        _ty: wasmtime_environ::VMSharedTypeIndex,
+        _layout: &GcStructLayout,
+    ) -> Result<Option<VMStructRef>> {
+        bail!(
+            "GC support disabled either in the `Config` or at compile time \
+             because the `gc` cargo feature was not enabled"
+        )
+    }
+    fn dealloc_uninit_struct(&mut self, _structref: VMStructRef) {
+        unreachable!()
+    }
+    fn gc_object_data(&mut self, _gc_ref: &VMGcRef) -> VMGcObjectDataMut<'_> {
+        unreachable!()
+    }
+    fn alloc_uninit_array(
+        &mut self,
+        _ty: VMSharedTypeIndex,
+        _len: u32,
+        _layout: &GcArrayLayout,
+    ) -> Result<Option<VMArrayRef>> {
+        bail!(
+            "GC support disabled either in the `Config` or at compile time \
+             because the `gc` cargo feature was not enabled"
+        )
+    }
+    fn dealloc_uninit_array(&mut self, _structref: VMArrayRef) {
+        unreachable!()
+    }
+    fn array_len(&self, _arrayref: &VMArrayRef) -> u32 {
+        unreachable!()
+    }
+    fn gc<'a>(
+        &'a mut self,
+        _roots: GcRootsIter<'a>,
+        _host_data_table: &'a mut ExternRefHostDataTable,
+    ) -> Box<dyn GarbageCollection<'a> + 'a> {
+        return Box::new(NoGc);
 
-            struct NoGc;
+        struct NoGc;
 
-            impl<'a> GarbageCollection<'a> for NoGc {
-                fn collect_increment(&mut self) -> GcProgress {
-                    GcProgress::Complete
-                }
+        impl<'a> GarbageCollection<'a> for NoGc {
+            fn collect_increment(&mut self) -> GcProgress {
+                GcProgress::Complete
             }
         }
-        unsafe fn vmctx_gc_heap_base(&self) -> *mut u8 {
-            ptr::null_mut()
-        }
-        unsafe fn vmctx_gc_heap_bound(&self) -> usize {
-            0
-        }
-        unsafe fn vmctx_gc_heap_data(&self) -> *mut u8 {
-            ptr::null_mut()
-        }
-        #[cfg(feature = "pooling-allocator")]
-        fn reset(&mut self) {}
     }
+    unsafe fn vmctx_gc_heap_base(&self) -> *mut u8 {
+        ptr::null_mut()
+    }
+    unsafe fn vmctx_gc_heap_bound(&self) -> usize {
+        0
+    }
+    unsafe fn vmctx_gc_heap_data(&self) -> *mut u8 {
+        ptr::null_mut()
+    }
+    #[cfg(feature = "pooling-allocator")]
+    fn reset(&mut self) {}
 }

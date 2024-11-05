@@ -115,6 +115,17 @@ wasmtime_option_group! {
         /// The maximum runtime size of each linear memory in the pooling
         /// allocator, in bytes.
         pub pooling_max_memory_size: Option<usize>,
+
+        /// The maximum table elements for any table defined in a module when
+        /// using the pooling allocator.
+        pub pooling_table_elements: Option<usize>,
+
+        /// The maximum size, in bytes, allocated for a core instance's metadata
+        /// when using the pooling allocator.
+        pub pooling_max_core_instance_size: Option<usize>,
+
+        /// Enable or disable the use of host signal handlers for traps.
+        pub signals_based_traps: Option<bool>,
     }
 
     enum Optimize {
@@ -191,6 +202,12 @@ wasmtime_option_group! {
         /// Maximum stack size, in bytes, that wasm is allowed to consume before a
         /// stack overflow is reported.
         pub max_wasm_stack: Option<usize>,
+        /// Stack size, in bytes, that will be allocated for async stacks.
+        ///
+        /// Note that this must be larger than `max-wasm-stack` and the
+        /// difference between the two is how much stack the host has to execute
+        /// on.
+        pub async_stack_size: Option<usize>,
         /// Allow unknown exports when running commands.
         pub unknown_exports_allow: Option<bool>,
         /// Allow the main module to import unknown functions, using an
@@ -207,7 +224,7 @@ wasmtime_option_group! {
         /// WebAssembly modules to return -1 and fail.
         pub max_memory_size: Option<usize>,
         /// Maximum size, in table elements, that a table is allowed to reach.
-        pub max_table_elements: Option<u32>,
+        pub max_table_elements: Option<usize>,
         /// Maximum number of WebAssembly instances allowed to be created.
         pub max_instances: Option<usize>,
         /// Maximum number of WebAssembly tables allowed to be created.
@@ -585,6 +602,9 @@ impl CommonOptions {
         if let Some(enable) = self.opts.memory_init_cow {
             config.memory_init_cow(enable);
         }
+        if let Some(enable) = self.opts.signals_based_traps {
+            config.signals_based_traps(enable);
+        }
 
         match_feature! {
             ["pooling-allocator" : self.opts.pooling_allocator.or(pooling_allocator_default)]
@@ -608,6 +628,12 @@ impl CommonOptions {
                     }
                     if let Some(limit) = self.opts.pooling_total_tables {
                         cfg.total_tables(limit);
+                    }
+                    if let Some(limit) = self.opts.pooling_table_elements {
+                        cfg.table_elements(limit);
+                    }
+                    if let Some(limit) = self.opts.pooling_max_core_instance_size {
+                        cfg.max_core_instance_size(limit);
                     }
                     match_feature! {
                         ["async" : self.opts.pooling_total_stacks]
@@ -638,8 +664,23 @@ impl CommonOptions {
             anyhow::bail!("memory protection keys require the pooling allocator");
         }
 
+        match_feature! {
+            ["async" : self.wasm.async_stack_size]
+            size => config.async_stack_size(size),
+            _ => err,
+        }
+
         if let Some(max) = self.wasm.max_wasm_stack {
             config.max_wasm_stack(max);
+
+            // If `-Wasync-stack-size` isn't passed then automatically adjust it
+            // to the wasm stack size provided here too. That prevents the need
+            // to pass both when one can generally be inferred from the other.
+            #[cfg(feature = "async")]
+            if self.wasm.async_stack_size.is_none() {
+                const DEFAULT_HOST_STACK: usize = 512 << 10;
+                config.async_stack_size(max + DEFAULT_HOST_STACK);
+            }
         }
 
         if let Some(enable) = self.wasm.relaxed_simd_deterministic {

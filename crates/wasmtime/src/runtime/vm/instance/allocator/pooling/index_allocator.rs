@@ -1,8 +1,8 @@
 //! Index/slot allocator policies for the pooling allocator.
 
+use crate::hash_map::{Entry, HashMap};
 use crate::prelude::*;
 use crate::runtime::vm::CompiledModuleId;
-use std::collections::hash_map::{Entry, HashMap};
 use std::mem;
 use std::sync::Mutex;
 use wasmtime_environ::DefinedMemoryIndex;
@@ -491,9 +491,9 @@ mod test {
     fn test_next_available_allocation_strategy() {
         for size in 0..20 {
             let state = ModuleAffinityIndexAllocator::new(size, 0);
-            assert_eq!(state.num_empty_slots() as u32, size);
+            assert_eq!(state.num_empty_slots(), usize::try_from(size).unwrap());
             for i in 0..size {
-                assert_eq!(state.num_empty_slots() as u32, size - i);
+                assert_eq!(state.num_empty_slots(), usize::try_from(size - i).unwrap());
                 assert_eq!(state.alloc(None).unwrap().index(), i as usize);
             }
             assert!(state.alloc(None).is_none());
@@ -624,8 +624,7 @@ mod test {
         // affinity is occurring.
         assert!(
             hits > (amt / 5),
-            "expected at least 20000 (20%) ID-reuses but got {}",
-            hits
+            "expected at least 20000 (20%) ID-reuses but got {hits}"
         );
     }
 

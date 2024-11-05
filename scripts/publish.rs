@@ -17,12 +17,12 @@ use std::time::Duration;
 
 // note that this list must be topologically sorted by dependencies
 const CRATES_TO_PUBLISH: &[&str] = &[
-    // cranelift
-    "pulley-interpreter",
+    // pulley
     "cranelift-bitset",
+    "pulley-interpreter",
+    // cranelift
     "cranelift-isle",
     "cranelift-entity",
-    "wasmtime-types",
     "cranelift-bforest",
     "cranelift-codegen-shared",
     "cranelift-codegen-meta",
@@ -33,7 +33,6 @@ const CRATES_TO_PUBLISH: &[&str] = &[
     "cranelift-serde",
     "cranelift-module",
     "cranelift-frontend",
-    "cranelift-wasm",
     "cranelift-native",
     "cranelift-object",
     "cranelift-interpreter",
@@ -107,7 +106,6 @@ const PUBLIC_CRATES: &[&str] = &[
     "cranelift-serde",
     "cranelift-module",
     "cranelift-frontend",
-    "cranelift-wasm",
     "cranelift-native",
     "cranelift-object",
     "cranelift-interpreter",
@@ -140,6 +138,7 @@ fn main() {
     crates.push(root);
     find_crates("crates".as_ref(), &ws, &mut crates);
     find_crates("cranelift".as_ref(), &ws, &mut crates);
+    find_crates("pulley".as_ref(), &ws, &mut crates);
     find_crates("winch".as_ref(), &ws, &mut crates);
 
     let pos = CRATES_TO_PUBLISH

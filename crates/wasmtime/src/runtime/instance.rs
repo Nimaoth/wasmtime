@@ -341,8 +341,7 @@ impl Instance {
             compiled_module.module(),
             store
                 .engine()
-                .config()
-                .features
+                .features()
                 .contains(WasmFeatures::BULK_MEMORY),
         )?;
 
@@ -539,7 +538,7 @@ impl Instance {
             .and_then(|f| f.into_func())
             .ok_or_else(|| anyhow!("failed to find function export `{}`", name))?;
         Ok(f.typed::<Params, Results>(store)
-            .with_context(|| format!("failed to convert function `{}` to given type", name))?)
+            .with_context(|| format!("failed to convert function `{name}` to given type"))?)
     }
 
     /// Looks up an exported [`Table`] value by name.

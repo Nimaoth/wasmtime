@@ -92,9 +92,10 @@ struct Exports {
 
 struct ExportField {
     ty: String,
-    ty_pre: String,
-    getter: String,
-    getter_pre: String,
+    ty_index: String,
+    load: String,
+    get_index_from_component: String,
+    get_index_from_instance: String,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -123,6 +124,10 @@ pub struct Opts {
 
     /// Whether or not to emit `tracing` macro calls on function entry/exit.
     pub tracing: bool,
+
+    /// Whether or not `tracing` macro calls should included argument and
+    /// return values which contain dynamically-sized `list` values.
+    pub verbose_tracing: bool,
 
     /// Whether or not to use async rust functions and traits.
     pub async_: AsyncConfig,
@@ -179,6 +184,17 @@ pub struct TrappableError {
     pub rust_type_name: String,
 }
 
+/// Which imports should be generated as async functions.
+///
+/// The imports should be declared in the following format:
+/// - Regular functions: `"{function-name}"`
+/// - Resource methods: `"[method]{resource-name}.{method-name}"`
+/// - Resource destructors: `"[drop]{resource-name}"`
+///
+/// Examples:
+/// - Regular function: `"get-environment"`
+/// - Resource method: `"[method]input-stream.read"`
+/// - Resource destructor: `"[drop]input-stream"`
 #[derive(Default, Debug, Clone)]
 pub enum AsyncConfig {
     /// No functions are `async`.
@@ -203,6 +219,10 @@ impl AsyncConfig {
             AsyncConfig::AllExceptImports(set) => !set.contains(f),
             AsyncConfig::OnlyImports(set) => set.contains(f),
         }
+    }
+
+    pub fn is_drop_async(&self, r: &str) -> bool {
+        self.is_import_async(&format!("[drop]{r}"))
     }
 
     pub fn maybe_async(&self) -> bool {
@@ -503,22 +523,28 @@ impl Wasmtime {
         let mut gen = InterfaceGenerator::new(self, resolve);
         let field;
         let ty;
-        let ty_pre;
-        let getter;
-        let getter_pre;
+        let ty_index;
+        let load;
+        let get_index_from_component;
+        let get_index_from_instance;
         match item {
             WorldItem::Function(func) => {
                 gen.define_rust_guest_export(resolve, None, func);
                 let body = mem::take(&mut gen.src).into();
-                getter = gen.extract_typed_function(func).1;
+                load = gen.extract_typed_function(func).1;
                 assert!(gen.src.is_empty());
                 self.exports.funcs.push(body);
-                ty_pre = format!("{wt}::component::ComponentExportIndex");
+                ty_index = format!("{wt}::component::ComponentExportIndex");
                 field = func_field_name(resolve, func);
                 ty = format!("{wt}::component::Func");
-                getter_pre = format!(
+                get_index_from_component = format!(
                     "_component.export_index(None, \"{}\")
                         .ok_or_else(|| anyhow::anyhow!(\"no function export `{0}` found\"))?.1",
+                    func.name
+                );
+                get_index_from_instance = format!(
+                    "_instance.get_export(&mut store, None, \"{}\")
+                        .ok_or_else(|| anyhow::anyhow!(\"no function export `{0}` found\"))?",
                     func.name
                 );
             }
@@ -545,7 +571,7 @@ impl Wasmtime {
                 uwriteln!(gen.src, "}}");
 
                 uwriteln!(gen.src, "#[derive(Clone)]");
-                uwriteln!(gen.src, "pub struct {struct_name}Pre {{");
+                uwriteln!(gen.src, "pub struct {struct_name}Indices {{");
                 for (_, func) in iface.functions.iter() {
                     uwriteln!(
                         gen.src,
@@ -555,41 +581,67 @@ impl Wasmtime {
                 }
                 uwriteln!(gen.src, "}}");
 
-                uwriteln!(gen.src, "impl {struct_name}Pre {{");
+                uwriteln!(gen.src, "impl {struct_name}Indices {{");
                 let instance_name = resolve.name_world_key(name);
                 uwrite!(
                     gen.src,
                     "
+/// Constructor for [`{struct_name}Indices`] which takes a
+/// [`Component`]({wt}::component::Component) as input and can be executed
+/// before instantiation.
+///
+/// This constructor can be used to front-load string lookups to find exports
+/// within a component.
 pub fn new(
     component: &{wt}::component::Component,
-) -> {wt}::Result<{struct_name}Pre> {{
-    let _component = component;
+) -> {wt}::Result<{struct_name}Indices> {{
     let (_, instance) = component.export_index(None, \"{instance_name}\")
         .ok_or_else(|| anyhow::anyhow!(\"no exported instance named `{instance_name}`\"))?;
-    let _lookup = |name: &str| {{
-        _component.export_index(Some(&instance), name)
+    Self::_new(|name| {{
+        component.export_index(Some(&instance), name)
             .map(|p| p.1)
-            .ok_or_else(|| {{
-                anyhow::anyhow!(
-                    \"instance export `{instance_name}` does \\
-                      not have export `{{name}}`\"
-                )
-            }})
+    }})
+}}
+
+/// This constructor is similar to [`{struct_name}Indices::new`] except that it
+/// performs string lookups after instantiation time.
+pub fn new_instance(
+    mut store: impl {wt}::AsContextMut,
+    instance: &{wt}::component::Instance,
+) -> {wt}::Result<{struct_name}Indices> {{
+    let instance_export = instance.get_export(&mut store, None, \"{instance_name}\")
+        .ok_or_else(|| anyhow::anyhow!(\"no exported instance named `{instance_name}`\"))?;
+    Self::_new(|name| {{
+        instance.get_export(&mut store, Some(&instance_export), name)
+    }})
+}}
+
+fn _new(
+    mut lookup: impl FnMut (&str) -> Option<{wt}::component::ComponentExportIndex>,
+) -> {wt}::Result<{struct_name}Indices> {{
+    let mut lookup = move |name| {{
+        lookup(name).ok_or_else(|| {{
+            anyhow::anyhow!(
+                \"instance export `{instance_name}` does \\
+                  not have export `{{name}}`\"
+            )
+        }})
     }};
+    let _ = &mut lookup;
                     "
                 );
                 let mut fields = Vec::new();
                 for (_, func) in iface.functions.iter() {
                     let name = func_field_name(resolve, func);
-                    uwriteln!(gen.src, "let {name} = _lookup(\"{}\")?;", func.name);
+                    uwriteln!(gen.src, "let {name} = lookup(\"{}\")?;", func.name);
                     fields.push(name);
                 }
-                uwriteln!(gen.src, "Ok({struct_name}Pre {{");
+                uwriteln!(gen.src, "Ok({struct_name}Indices {{");
                 for name in fields {
                     uwriteln!(gen.src, "{name},");
                 }
                 uwriteln!(gen.src, "}})");
-                uwriteln!(gen.src, "}}");
+                uwriteln!(gen.src, "}}"); // end `fn _new`
 
                 uwrite!(
                     gen.src,
@@ -616,7 +668,7 @@ pub fn new(
                 }
                 uwriteln!(gen.src, "}})");
                 uwriteln!(gen.src, "}}"); // end `fn new`
-                uwriteln!(gen.src, "}}"); // end `impl {struct_name}Pre`
+                uwriteln!(gen.src, "}}"); // end `impl {struct_name}Indices`
 
                 uwriteln!(gen.src, "impl {struct_name} {{");
                 let mut resource_methods = IndexMap::new();
@@ -698,7 +750,7 @@ pub fn new(
                     None => (format!("exports::{snake}::{struct_name}"), snake.clone()),
                 };
                 field = format!("interface{}", self.exports.fields.len());
-                getter = format!("self.{field}.load(&mut store, &_instance)?");
+                load = format!("self.{field}.load(&mut store, &_instance)?");
                 self.exports.funcs.push(format!(
                     "
                         pub fn {method_name}(&self) -> &{path} {{
@@ -706,18 +758,21 @@ pub fn new(
                         }}
                     ",
                 ));
-                ty_pre = format!("{path}Pre");
+                ty_index = format!("{path}Indices");
                 ty = path;
-                getter_pre = format!("{ty_pre}::new(_component)?");
+                get_index_from_component = format!("{ty_index}::new(_component)?");
+                get_index_from_instance =
+                    format!("{ty_index}::new_instance(&mut store, _instance)?");
             }
         }
         let prev = self.exports.fields.insert(
             field,
             ExportField {
                 ty,
-                ty_pre,
-                getter,
-                getter_pre,
+                ty_index,
+                load,
+                get_index_from_component,
+                get_index_from_instance,
             },
         );
         assert!(prev.is_none());
@@ -735,29 +790,85 @@ pub fn new(
         uwriteln!(
             self.src,
             "
-            /// Auto-generated bindings for a pre-instantiated version of a
-            /// component which implements the world `{world_name}`.
-            ///
-            /// This structure is created through [`{camel}Pre::new`] which
-            /// takes a [`InstancePre`]({wt}::component::InstancePre) that
-            /// has been created through a [`Linker`]({wt}::component::Linker).
-            pub struct {camel}Pre<T> {{"
+/// Auto-generated bindings for a pre-instantiated version of a
+/// component which implements the world `{world_name}`.
+///
+/// This structure is created through [`{camel}Pre::new`] which
+/// takes a [`InstancePre`]({wt}::component::InstancePre) that
+/// has been created through a [`Linker`]({wt}::component::Linker).
+///
+/// For more information see [`{camel}`] as well.
+pub struct {camel}Pre<T> {{
+    instance_pre: {wt}::component::InstancePre<T>,
+    indices: {camel}Indices,
+}}
+
+impl<T> Clone for {camel}Pre<T> {{
+    fn clone(&self) -> Self {{
+        Self {{
+            instance_pre: self.instance_pre.clone(),
+            indices: self.indices.clone(),
+        }}
+    }}
+}}
+
+impl<_T> {camel}Pre<_T> {{
+    /// Creates a new copy of `{camel}Pre` bindings which can then
+    /// be used to instantiate into a particular store.
+    ///
+    /// This method may fail if the component behind `instance_pre`
+    /// does not have the required exports.
+    pub fn new(instance_pre: {wt}::component::InstancePre<_T>) -> {wt}::Result<Self> {{
+        let indices = {camel}Indices::new(instance_pre.component())?;
+        Ok(Self {{ instance_pre, indices }})
+    }}
+
+    pub fn engine(&self) -> &{wt}::Engine {{
+        self.instance_pre.engine()
+    }}
+
+    pub fn instance_pre(&self) -> &{wt}::component::InstancePre<_T> {{
+        &self.instance_pre
+    }}
+
+    /// Instantiates a new instance of [`{camel}`] within the
+    /// `store` provided.
+    ///
+    /// This function will use `self` as the pre-instantiated
+    /// instance to perform instantiation. Afterwards the preloaded
+    /// indices in `self` are used to lookup all exports on the
+    /// resulting instance.
+    pub {async_} fn instantiate{async__}(
+        &self,
+        mut store: impl {wt}::AsContextMut<Data = _T>,
+    ) -> {wt}::Result<{camel}>
+        {where_clause}
+    {{
+        let mut store = store.as_context_mut();
+        let instance = self.instance_pre.instantiate{async__}(&mut store){await_}?;
+        self.indices.load(&mut store, &instance)
+    }}
+}}
+"
         );
-        uwriteln!(self.src, "instance_pre: {wt}::component::InstancePre<T>,");
+
+        uwriteln!(
+            self.src,
+            "
+            /// Auto-generated bindings for index of the exports of
+            /// `{world_name}`.
+            ///
+            /// This is an implementation detail of [`{camel}Pre`] and can
+            /// be constructed if needed as well.
+            ///
+            /// For more information see [`{camel}`] as well.
+            #[derive(Clone)]
+            pub struct {camel}Indices {{"
+        );
         for (name, field) in self.exports.fields.iter() {
-            uwriteln!(self.src, "{name}: {},", field.ty_pre);
+            uwriteln!(self.src, "{name}: {},", field.ty_index);
         }
         self.src.push_str("}\n");
-
-        uwriteln!(self.src, "impl<T> Clone for {camel}Pre<T> {{");
-        uwriteln!(self.src, "fn clone(&self) -> Self {{");
-        uwriteln!(self.src, "Self {{ instance_pre: self.instance_pre.clone(),");
-        for (name, _field) in self.exports.fields.iter() {
-            uwriteln!(self.src, "{name}: self.{name}.clone(),");
-        }
-        uwriteln!(self.src, "}}"); // `Self ...
-        uwriteln!(self.src, "}}"); // `fn clone`
-        uwriteln!(self.src, "}}"); // `impl Clone`
 
         uwriteln!(
             self.src,
@@ -765,10 +876,33 @@ pub fn new(
                 /// Auto-generated bindings for an instance a component which
                 /// implements the world `{world_name}`.
                 ///
-                /// This structure is created through either
-                /// [`{camel}::instantiate{async__}`] or by first creating
-                /// a [`{camel}Pre`] followed by using
-                /// [`{camel}Pre::instantiate{async__}`].
+                /// This structure can be created through a number of means
+                /// depending on your requirements and what you have on hand:
+                ///
+                /// * The most convenient way is to use
+                ///   [`{camel}::instantiate{async__}`] which only needs a
+                ///   [`Store`], [`Component`], and [`Linker`].
+                ///
+                /// * Alternatively you can create a [`{camel}Pre`] ahead of
+                ///   time with a [`Component`] to front-load string lookups
+                ///   of exports once instead of per-instantiation. This
+                ///   method then uses [`{camel}Pre::instantiate{async__}`] to
+                ///   create a [`{camel}`].
+                ///
+                /// * If you've instantiated the instance yourself already
+                ///   then you can use [`{camel}::new`].
+                ///
+                /// * You can also access the guts of instantiation through
+                ///   [`{camel}Indices::new_instance`] followed
+                ///   by [`{camel}Indices::load`] to crate an instance of this
+                ///   type.
+                ///
+                /// These methods are all equivalent to one another and move
+                /// around the tradeoff of what work is performed when.
+                ///
+                /// [`Store`]: {wt}::Store
+                /// [`Component`]: {wt}::component::Component
+                /// [`Linker`]: {wt}::component::Linker
                 pub struct {camel} {{"
         );
         for (name, field) in self.exports.fields.iter() {
@@ -789,23 +923,20 @@ pub fn new(
 
         uwriteln!(
             self.src,
-            "impl<_T> {camel}Pre<_T> {{
-                /// Creates a new copy of `{camel}Pre` bindings which can then
+            "impl {camel}Indices {{
+                /// Creates a new copy of `{camel}Indices` bindings which can then
                 /// be used to instantiate into a particular store.
                 ///
-                /// This method may fail if the component behind `instance_pre`
-                /// does not have the required exports.
-                pub fn new(
-                    instance_pre: {wt}::component::InstancePre<_T>,
-                ) -> {wt}::Result<Self> {{
-                    let _component = instance_pre.component();
+                /// This method may fail if the component does not have the
+                /// required exports.
+                pub fn new(component: &{wt}::component::Component) -> {wt}::Result<Self> {{
+                    let _component = component;
             ",
         );
         for (name, field) in self.exports.fields.iter() {
-            uwriteln!(self.src, "let {name} = {};", field.getter_pre);
+            uwriteln!(self.src, "let {name} = {};", field.get_index_from_component);
         }
-        uwriteln!(self.src, "Ok({camel}Pre {{");
-        uwriteln!(self.src, "instance_pre,");
+        uwriteln!(self.src, "Ok({camel}Indices {{");
         for (name, _) in self.exports.fields.iter() {
             uwriteln!(self.src, "{name},");
         }
@@ -815,46 +946,56 @@ pub fn new(
         uwriteln!(
             self.src,
             "
-                /// Instantiates a new instance of [`{camel}`] within the
-                /// `store` provided.
+                /// Creates a new instance of [`{camel}Indices`] from an
+                /// instantiated component.
                 ///
-                /// This function will use `self` as the pre-instantiated
-                /// instance to perform instantiation. Afterwards the preloaded
-                /// indices in `self` are used to lookup all exports on the
-                /// resulting instance.
-                pub {async_} fn instantiate{async__}(
-                    &self,
-                    mut store: impl {wt}::AsContextMut<Data = _T>,
-                ) -> {wt}::Result<{camel}>
-                    {where_clause}
-                {{
-                    let mut store = store.as_context_mut();
-                    let _instance = self.instance_pre.instantiate{async__}(&mut store){await_}?;
+                /// This method of creating a [`{camel}`] will perform string
+                /// lookups for all exports when this method is called. This
+                /// will only succeed if the provided instance matches the
+                /// requirements of [`{camel}`].
+                pub fn new_instance(
+                    mut store: impl {wt}::AsContextMut,
+                    instance: &{wt}::component::Instance,
+                ) -> {wt}::Result<Self> {{
+                    let _instance = instance;
             ",
         );
         for (name, field) in self.exports.fields.iter() {
-            uwriteln!(self.src, "let {name} = {};", field.getter);
+            uwriteln!(self.src, "let {name} = {};", field.get_index_from_instance);
+        }
+        uwriteln!(self.src, "Ok({camel}Indices {{");
+        for (name, _) in self.exports.fields.iter() {
+            uwriteln!(self.src, "{name},");
+        }
+        uwriteln!(self.src, "}})");
+        uwriteln!(self.src, "}}"); // close `fn new_instance`
+
+        uwriteln!(
+            self.src,
+            "
+                /// Uses the indices stored in `self` to load an instance
+                /// of [`{camel}`] from the instance provided.
+                ///
+                /// Note that at this time this method will additionally
+                /// perform type-checks of all exports.
+                pub fn load(
+                    &self,
+                    mut store: impl {wt}::AsContextMut,
+                    instance: &{wt}::component::Instance,
+                ) -> {wt}::Result<{camel}> {{
+                    let _instance = instance;
+            ",
+        );
+        for (name, field) in self.exports.fields.iter() {
+            uwriteln!(self.src, "let {name} = {};", field.load);
         }
         uwriteln!(self.src, "Ok({camel} {{");
         for (name, _) in self.exports.fields.iter() {
             uwriteln!(self.src, "{name},");
         }
         uwriteln!(self.src, "}})");
-        uwriteln!(self.src, "}}"); // close `fn new`
-        uwriteln!(
-            self.src,
-            "
-                pub fn engine(&self) -> &{wt}::Engine {{
-                    self.instance_pre.engine()
-                }}
-
-                pub fn instance_pre(&self) -> &{wt}::component::InstancePre<_T> {{
-                    &self.instance_pre
-                }}
-            ",
-        );
-
-        uwriteln!(self.src, "}}");
+        uwriteln!(self.src, "}}"); // close `fn load`
+        uwriteln!(self.src, "}}"); // close `impl {camel}Indices`
 
         uwriteln!(
             self.src,
@@ -870,6 +1011,16 @@ pub fn new(
                 {{
                     let pre = linker.instantiate_pre(component)?;
                     {camel}Pre::new(pre)?.instantiate{async__}(store){await_}
+                }}
+
+                /// Convenience wrapper around [`{camel}Indices::new_instance`] and
+                /// [`{camel}Indices::load`].
+                pub fn new(
+                    mut store: impl {wt}::AsContextMut,
+                    instance: &{wt}::component::Instance,
+                ) -> {wt}::Result<{camel}> {{
+                    let indices = {camel}Indices::new_instance(&mut store, instance)?;
+                    indices.load(store, instance)
                 }}
             ",
         );
@@ -1318,17 +1469,12 @@ impl Wasmtime {
                 "
             );
             for name in get_world_resources(resolve, world) {
-                let camel = name.to_upper_camel_case();
-                uwriteln!(
-                    self.src,
-                    "
-                        linker.resource(
-                            \"{name}\",
-                            {wt}::component::ResourceType::host::<{camel}>(),
-                            move |mut store, rep| -> {wt}::Result<()> {{
-                                Host{camel}::drop(&mut host_getter(store.data_mut()), {wt}::component::Resource::new_own(rep))
-                            }},
-                        )?;"
+                Self::generate_add_resource_to_linker(
+                    &mut self.src,
+                    &self.opts,
+                    &wt,
+                    "linker",
+                    name,
                 );
             }
             for f in self.import_functions.iter() {
@@ -1364,6 +1510,41 @@ impl Wasmtime {
                 uwriteln!(self.src, "{path}::add_to_linker(linker, get)?;");
             }
             uwriteln!(self.src, "Ok(())\n}}");
+        }
+    }
+
+    fn generate_add_resource_to_linker(
+        src: &mut Source,
+        opts: &Opts,
+        wt: &str,
+        inst: &str,
+        name: &str,
+    ) {
+        let camel = name.to_upper_camel_case();
+        if opts.async_.is_drop_async(name) {
+            uwriteln!(
+                src,
+                "{inst}.resource_async(
+                    \"{name}\",
+                    {wt}::component::ResourceType::host::<{camel}>(),
+                    move |mut store, rep| {{
+                        std::boxed::Box::new(async move {{
+                            Host{camel}::drop(&mut host_getter(store.data_mut()), {wt}::component::Resource::new_own(rep)).await
+                        }})
+                    }},
+                )?;"
+            )
+        } else {
+            uwriteln!(
+                src,
+                "{inst}.resource(
+                    \"{name}\",
+                    {wt}::component::ResourceType::host::<{camel}>(),
+                    move |mut store, rep| -> {wt}::Result<()> {{
+                        Host{camel}::drop(&mut host_getter(store.data_mut()), {wt}::component::Resource::new_own(rep))
+                    }},
+                )?;"
+            )
         }
     }
 }
@@ -1490,6 +1671,9 @@ impl<'a> InterfaceGenerator<'a> {
                 self.push_str(";\n");
             }
 
+            if self.gen.opts.async_.is_drop_async(name) {
+                uwrite!(self.src, "async ");
+            }
             uwrite!(
                 self.src,
                 "fn drop(&mut self, rep: {wt}::component::Resource<{camel}>) -> {wt}::Result<()>;"
@@ -1527,11 +1711,19 @@ impl<'a> InterfaceGenerator<'a> {
                     }
                     uwriteln!(self.src, "}}");
                 }
-                uwriteln!(self.src, "
-                    fn drop(&mut self, rep: {wt}::component::Resource<{camel}>) -> {wt}::Result<()> {{
-                        Host{camel}::drop(*self, rep)
-                    }}",
-                );
+                if self.gen.opts.async_.is_drop_async(name) {
+                    uwriteln!(self.src, "
+                        async fn drop(&mut self, rep: {wt}::component::Resource<{camel}>) -> {wt}::Result<()> {{
+                            Host{camel}::drop(*self, rep).await
+                        }}",
+                    );
+                } else {
+                    uwriteln!(self.src, "
+                        fn drop(&mut self, rep: {wt}::component::Resource<{camel}>) -> {wt}::Result<()> {{
+                            Host{camel}::drop(*self, rep)
+                        }}",
+                    );
+                }
                 uwriteln!(self.src, "}}");
             }
         } else {
@@ -1590,7 +1782,7 @@ impl<'a> InterfaceGenerator<'a> {
                 self.push_str(")]\n")
             }
 
-            self.push_str(&format!("pub struct {}", name));
+            self.push_str(&format!("pub struct {name}"));
             self.print_generics(lt);
             self.push_str(" {\n");
             for field in record.fields.iter() {
@@ -1613,7 +1805,7 @@ impl<'a> InterfaceGenerator<'a> {
             self.push_str(
                 "fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {\n",
             );
-            self.push_str(&format!("f.debug_struct(\"{}\")", name));
+            self.push_str(&format!("f.debug_struct(\"{name}\")"));
             for field in record.fields.iter() {
                 self.push_str(&format!(
                     ".field(\"{}\", &self.{})",
@@ -1654,7 +1846,7 @@ impl<'a> InterfaceGenerator<'a> {
         for (name, mode) in self.modes_of(id) {
             let lt = self.lifetime_for(&info, mode);
             self.rustdoc(docs);
-            self.push_str(&format!("pub type {}", name));
+            self.push_str(&format!("pub type {name}"));
             self.print_generics(lt);
             self.push_str(" = (");
             for ty in tuple.types.iter() {
@@ -1708,7 +1900,7 @@ impl<'a> InterfaceGenerator<'a> {
         for (name, mode) in self.modes_of(id) {
             self.rustdoc(docs);
             let lt = self.lifetime_for(&info, mode);
-            self.push_str(&format!("pub type {}", name));
+            self.push_str(&format!("pub type {name}"));
             self.print_generics(lt);
             self.push_str("= Option<");
             self.print_ty(payload, mode);
@@ -1725,12 +1917,12 @@ impl<'a> InterfaceGenerator<'a> {
         uwriteln!(
             self.src,
             "assert!({} == <{name} as {wt}::component::ComponentType>::SIZE32);",
-            self.gen.sizes.size(&Type::Id(id)),
+            self.gen.sizes.size(&Type::Id(id)).size_wasm32(),
         );
         uwriteln!(
             self.src,
             "assert!({} == <{name} as {wt}::component::ComponentType>::ALIGN32);",
-            self.gen.sizes.align(&Type::Id(id)),
+            self.gen.sizes.align(&Type::Id(id)).align_wasm32(),
         );
         self.push_str("};\n");
     }
@@ -1768,7 +1960,7 @@ impl<'a> InterfaceGenerator<'a> {
                 uwriteln!(self.src, "#[derive({wt}::component::Lift)]");
             }
             uwriteln!(self.src, "#[derive({wt}::component::Lower)]");
-            self.push_str(&format!("#[component({})]\n", derive_component));
+            self.push_str(&format!("#[component({derive_component})]\n"));
             if let Some(path) = &self.gen.opts.wasmtime_crate {
                 uwriteln!(self.src, "#[component(wasmtime_crate = {path})]\n");
             }
@@ -1790,7 +1982,7 @@ impl<'a> InterfaceGenerator<'a> {
             for (case_name, component_name, docs, payload) in cases.clone() {
                 self.rustdoc(docs);
                 if let Some(n) = component_name {
-                    self.push_str(&format!("#[component(name = \"{}\")] ", n));
+                    self.push_str(&format!("#[component(name = \"{n}\")] "));
                 }
                 self.push_str(&case_name);
                 if let Some(ty) = payload {
@@ -1868,7 +2060,7 @@ impl<'a> InterfaceGenerator<'a> {
                 self.push_str("(e)");
             }
             self.push_str(" => {\n");
-            self.push_str(&format!("f.debug_tuple(\"{}::{}\")", name, case_name));
+            self.push_str(&format!("f.debug_tuple(\"{name}::{case_name}\")"));
             if payload.is_some() {
                 self.push_str(".field(e)");
             }
@@ -1886,7 +2078,7 @@ impl<'a> InterfaceGenerator<'a> {
         for (name, mode) in self.modes_of(id) {
             self.rustdoc(docs);
             let lt = self.lifetime_for(&info, mode);
-            self.push_str(&format!("pub type {}", name));
+            self.push_str(&format!("pub type {name}"));
             self.print_generics(lt);
             self.push_str("= Result<");
             self.print_optional_ty(result.ok.as_ref(), mode);
@@ -1930,7 +2122,14 @@ impl<'a> InterfaceGenerator<'a> {
         self.push_str(&derives.into_iter().collect::<Vec<_>>().join(", "));
         self.push_str(")]\n");
 
-        self.push_str(&format!("pub enum {} {{\n", name));
+        let repr = match enum_.cases.len().ilog2() {
+            0..=7 => "u8",
+            8..=15 => "u16",
+            _ => "u32",
+        };
+        uwriteln!(self.src, "#[repr({repr})]");
+
+        self.push_str(&format!("pub enum {name} {{\n"));
         for case in enum_.cases.iter() {
             self.rustdoc(&case.docs);
             self.push_str(&format!("#[component(name = \"{}\")]", case.name));
@@ -2023,7 +2222,7 @@ impl<'a> InterfaceGenerator<'a> {
         let info = self.info(id);
         for (name, mode) in self.modes_of(id) {
             self.rustdoc(docs);
-            self.push_str(&format!("pub type {}", name));
+            self.push_str(&format!("pub type {name}"));
             let lt = self.lifetime_for(&info, mode);
             self.print_generics(lt);
             self.push_str(" = ");
@@ -2041,7 +2240,7 @@ impl<'a> InterfaceGenerator<'a> {
         for (name, mode) in self.modes_of(id) {
             let lt = self.lifetime_for(&info, mode);
             self.rustdoc(docs);
-            self.push_str(&format!("pub type {}", name));
+            self.push_str(&format!("pub type {name}"));
             self.print_generics(lt);
             self.push_str(" = ");
             self.print_list(ty, mode);
@@ -2225,17 +2424,13 @@ impl<'a> InterfaceGenerator<'a> {
         uwriteln!(self.src, "let mut inst = linker.instance(\"{name}\")?;");
 
         for name in get_resources(self.resolve, id) {
-            let camel = name.to_upper_camel_case();
-            uwriteln!(
-                self.src,
-                "inst.resource(
-                    \"{name}\",
-                    {wt}::component::ResourceType::host::<{camel}>(),
-                    move |mut store, rep| -> {wt}::Result<()> {{
-                        Host{camel}::drop(&mut host_getter(store.data_mut()), {wt}::component::Resource::new_own(rep))
-                    }},
-                )?;"
-            )
+            Wasmtime::generate_add_resource_to_linker(
+                &mut self.src,
+                &self.gen.opts,
+                &wt,
+                "inst",
+                name,
+            );
         }
 
         for (_, func) in iface.functions.iter() {
@@ -2343,16 +2538,13 @@ impl<'a> InterfaceGenerator<'a> {
             self.src.push_str(", ");
         }
         self.src.push_str(") |");
-        if self.gen.opts.async_.is_import_async(&func.name) {
-            uwriteln!(
-                self.src,
-                " {wt}::component::__internal::Box::new(async move {{ "
-            );
-        } else {
-            self.src.push_str(" { \n");
-        }
+        self.src.push_str(" {\n");
 
         if self.gen.opts.tracing {
+            if self.gen.opts.async_.is_import_async(&func.name) {
+                self.src.push_str("use tracing::Instrument;\n");
+            }
+
             uwrite!(
                 self.src,
                 "
@@ -2362,7 +2554,6 @@ impl<'a> InterfaceGenerator<'a> {
                        module = \"{}\",
                        function = \"{}\",
                    );
-                   let _enter = span.enter();
                ",
                 match owner {
                     TypeOwner::Interface(id) => self.resolve.interfaces[id]
@@ -2374,13 +2565,30 @@ impl<'a> InterfaceGenerator<'a> {
                 },
                 func.name,
             );
+        }
+
+        if self.gen.opts.async_.is_import_async(&func.name) {
+            uwriteln!(
+                self.src,
+                " {wt}::component::__internal::Box::new(async move {{ "
+            );
+        } else {
+            // Only directly enter the span if the function is sync. Otherwise
+            // we use tracing::Instrument to ensure that the span is not entered
+            // across an await point.
+            if self.gen.opts.tracing {
+                self.push_str("let _enter = span.enter();\n");
+            }
+        }
+
+        if self.gen.opts.tracing {
             let mut event_fields = func
                 .params
                 .iter()
                 .enumerate()
-                .map(|(i, (name, _ty))| {
+                .map(|(i, (name, ty))| {
                     let name = to_rust_ident(&name);
-                    format!("{name} = tracing::field::debug(&arg{i})")
+                    formatting_for_arg(&name, i, *ty, &self.gen.opts, &self.resolve)
                 })
                 .collect::<Vec<String>>();
             event_fields.push(format!("\"call\""));
@@ -2398,7 +2606,7 @@ impl<'a> InterfaceGenerator<'a> {
             FunctionKind::Freestanding => match owner {
                 TypeOwner::World(id) => format!(
                     "{}Imports",
-                    self.resolve.worlds[id].name.to_upper_camel_case()
+                    rust::to_rust_upper_camel_case(&self.resolve.worlds[id].name)
                 ),
                 _ => "Host".to_string(),
             },
@@ -2425,7 +2633,8 @@ impl<'a> InterfaceGenerator<'a> {
         if self.gen.opts.tracing {
             uwrite!(
                 self.src,
-                "tracing::event!(tracing::Level::TRACE, result = tracing::field::debug(&r), \"return\");"
+                "tracing::event!(tracing::Level::TRACE, {}, \"return\");",
+                formatting_for_results(&func.results, &self.gen.opts, &self.resolve)
             );
         }
 
@@ -2462,10 +2671,15 @@ impl<'a> InterfaceGenerator<'a> {
 
         if self.gen.opts.async_.is_import_async(&func.name) {
             // Need to close Box::new and async block
-            self.src.push_str("})");
-        } else {
-            self.src.push_str("}");
+
+            if self.gen.opts.tracing {
+                self.src.push_str("}.instrument(span))\n");
+            } else {
+                self.src.push_str("})\n");
+            }
         }
+
+        self.src.push_str("}\n");
     }
 
     fn generate_function_trait_sig(&mut self, func: &Function) {
@@ -2573,6 +2787,10 @@ impl<'a> InterfaceGenerator<'a> {
         }
 
         if self.gen.opts.tracing {
+            if is_async {
+                self.src.push_str("use tracing::Instrument;\n");
+            }
+
             let ns = match ns {
                 Some(key) => resolve.name_world_key(key),
                 None => "default".to_string(),
@@ -2585,10 +2803,17 @@ impl<'a> InterfaceGenerator<'a> {
                        module = \"{ns}\",
                        function = \"{}\",
                    );
-                   let _enter = span.enter();
                ",
                 func.name,
             ));
+
+            if !is_async {
+                self.src.push_str(
+                    "
+                   let _enter = span.enter();
+                   ",
+                );
+            }
         }
 
         self.src.push_str("let callee = unsafe {\n");
@@ -2623,11 +2848,22 @@ impl<'a> InterfaceGenerator<'a> {
         for (i, _) in func.params.iter().enumerate() {
             uwrite!(self.src, "arg{}, ", i);
         }
-        uwriteln!(self.src, ")){await_}?;");
 
+        let instrument = if is_async && self.gen.opts.tracing {
+            ".instrument(span.clone())"
+        } else {
+            ""
+        };
+        uwriteln!(self.src, ")){instrument}{await_}?;");
+
+        let instrument = if is_async && self.gen.opts.tracing {
+            ".instrument(span)"
+        } else {
+            ""
+        };
         uwriteln!(
             self.src,
-            "callee.post_return{async__}(store.as_context_mut()){await_}?;"
+            "callee.post_return{async__}(store.as_context_mut()){instrument}{await_}?;"
         );
 
         self.src.push_str("Ok(");
@@ -2721,6 +2957,89 @@ impl<'a> RustGenerator<'a> for InterfaceGenerator<'a> {
 
     fn wasmtime_path(&self) -> String {
         self.gen.wasmtime_path()
+    }
+}
+
+/// Produce a string for tracing a function argument.
+fn formatting_for_arg(
+    name: &str,
+    index: usize,
+    ty: Type,
+    opts: &Opts,
+    resolve: &Resolve,
+) -> String {
+    if !opts.verbose_tracing && type_contains_lists(ty, resolve) {
+        return format!("{name} = tracing::field::debug(\"...\")");
+    }
+
+    // Normal tracing.
+    format!("{name} = tracing::field::debug(&arg{index})")
+}
+
+/// Produce a string for tracing function results.
+fn formatting_for_results(results: &Results, opts: &Opts, resolve: &Resolve) -> String {
+    let contains_lists = match results {
+        Results::Anon(ty) => type_contains_lists(*ty, resolve),
+        Results::Named(params) => params
+            .iter()
+            .any(|(_, ty)| type_contains_lists(*ty, resolve)),
+    };
+
+    if !opts.verbose_tracing && contains_lists {
+        return format!("result = tracing::field::debug(\"...\")");
+    }
+
+    // Normal tracing.
+    format!("result = tracing::field::debug(&r)")
+}
+
+/// Test whether the given type contains lists.
+///
+/// Here, a `string` is not considered a list.
+fn type_contains_lists(ty: Type, resolve: &Resolve) -> bool {
+    match ty {
+        Type::Id(id) => match &resolve.types[id].kind {
+            TypeDefKind::Resource
+            | TypeDefKind::Unknown
+            | TypeDefKind::Flags(_)
+            | TypeDefKind::Handle(_)
+            | TypeDefKind::Enum(_) => false,
+            TypeDefKind::Option(ty) => type_contains_lists(*ty, resolve),
+            TypeDefKind::Result(Result_ { ok, err }) => {
+                option_type_contains_lists(*ok, resolve)
+                    || option_type_contains_lists(*err, resolve)
+            }
+            TypeDefKind::Record(record) => record
+                .fields
+                .iter()
+                .any(|field| type_contains_lists(field.ty, resolve)),
+            TypeDefKind::Tuple(tuple) => tuple
+                .types
+                .iter()
+                .any(|ty| type_contains_lists(*ty, resolve)),
+            TypeDefKind::Variant(variant) => variant
+                .cases
+                .iter()
+                .any(|case| option_type_contains_lists(case.ty, resolve)),
+            TypeDefKind::Type(ty) => type_contains_lists(*ty, resolve),
+            TypeDefKind::Future(ty) => option_type_contains_lists(*ty, resolve),
+            TypeDefKind::Stream(Stream { element, end }) => {
+                option_type_contains_lists(*element, resolve)
+                    || option_type_contains_lists(*end, resolve)
+            }
+            TypeDefKind::List(_) => true,
+        },
+
+        // Technically strings are lists too, but we ignore that here because
+        // they're usually short.
+        _ => false,
+    }
+}
+
+fn option_type_contains_lists(ty: Option<Type>, resolve: &Resolve) -> bool {
+    match ty {
+        Some(ty) => type_contains_lists(ty, resolve),
+        None => false,
     }
 }
 

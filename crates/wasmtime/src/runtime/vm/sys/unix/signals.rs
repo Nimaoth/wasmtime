@@ -1,11 +1,11 @@
 //! Trap handling on Unix based on POSIX signals.
 
-use crate::runtime::vm::traphandlers::{tls, TrapTest};
+use crate::runtime::vm::traphandlers::{tls, TrapRegisters, TrapTest};
 use crate::runtime::vm::VMContext;
 use std::cell::RefCell;
 use std::io;
-use std::mem::{self, MaybeUninit};
-use std::ptr::{self, null_mut};
+use std::mem;
+use std::ptr::{self, addr_of, addr_of_mut, null_mut};
 
 #[link(name = "wasmtime-helpers")]
 extern "C" {
@@ -26,10 +26,11 @@ extern "C" {
 pub type SignalHandler<'a> =
     dyn Fn(libc::c_int, *const libc::siginfo_t, *const libc::c_void) -> bool + Send + Sync + 'a;
 
-static mut PREV_SIGSEGV: MaybeUninit<libc::sigaction> = MaybeUninit::uninit();
-static mut PREV_SIGBUS: MaybeUninit<libc::sigaction> = MaybeUninit::uninit();
-static mut PREV_SIGILL: MaybeUninit<libc::sigaction> = MaybeUninit::uninit();
-static mut PREV_SIGFPE: MaybeUninit<libc::sigaction> = MaybeUninit::uninit();
+const UNINIT_SIGACTION: libc::sigaction = unsafe { mem::zeroed() };
+static mut PREV_SIGSEGV: libc::sigaction = UNINIT_SIGACTION;
+static mut PREV_SIGBUS: libc::sigaction = UNINIT_SIGACTION;
+static mut PREV_SIGILL: libc::sigaction = UNINIT_SIGACTION;
+static mut PREV_SIGFPE: libc::sigaction = UNINIT_SIGACTION;
 
 pub struct TrapHandler;
 
@@ -82,20 +83,20 @@ impl TrapHandler {
 
 unsafe fn foreach_handler(mut f: impl FnMut(*mut libc::sigaction, i32)) {
     // Allow handling OOB with signals on all architectures
-    f(PREV_SIGSEGV.as_mut_ptr(), libc::SIGSEGV);
+    f(addr_of_mut!(PREV_SIGSEGV), libc::SIGSEGV);
 
     // Handle `unreachable` instructions which execute `ud2` right now
-    f(PREV_SIGILL.as_mut_ptr(), libc::SIGILL);
+    f(addr_of_mut!(PREV_SIGILL), libc::SIGILL);
 
     // x86 and s390x use SIGFPE to report division by zero
     if cfg!(target_arch = "x86_64") || cfg!(target_arch = "s390x") {
-        f(PREV_SIGFPE.as_mut_ptr(), libc::SIGFPE);
+        f(addr_of_mut!(PREV_SIGFPE), libc::SIGFPE);
     }
 
     // Sometimes we need to handle SIGBUS too:
     // - On Darwin, guard page accesses are raised as SIGBUS.
     if cfg!(target_os = "macos") || cfg!(target_os = "freebsd") {
-        f(PREV_SIGBUS.as_mut_ptr(), libc::SIGBUS);
+        f(addr_of_mut!(PREV_SIGBUS), libc::SIGBUS);
     }
 
     // TODO(#1980): x86-32, if we support it, will also need a SIGFPE handler.
@@ -145,11 +146,11 @@ unsafe extern "C" fn trap_handler(
     context: *mut libc::c_void,
 ) {
     let previous = match signum {
-        libc::SIGSEGV => PREV_SIGSEGV.as_ptr(),
-        libc::SIGBUS => PREV_SIGBUS.as_ptr(),
-        libc::SIGFPE => PREV_SIGFPE.as_ptr(),
-        libc::SIGILL => PREV_SIGILL.as_ptr(),
-        _ => panic!("unknown signal: {}", signum),
+        libc::SIGSEGV => addr_of!(PREV_SIGSEGV),
+        libc::SIGBUS => addr_of!(PREV_SIGBUS),
+        libc::SIGFPE => addr_of!(PREV_SIGFPE),
+        libc::SIGILL => addr_of!(PREV_SIGILL),
+        _ => panic!("unknown signal: {signum}"),
     };
     let handled = tls::with(|info| {
         // If no wasm code is executing, we don't handle this as a wasm
@@ -166,23 +167,33 @@ unsafe extern "C" fn trap_handler(
         // Otherwise flag ourselves as handling a trap, do the trap
         // handling, and reset our trap handling flag. Then we figure
         // out what to do based on the result of the trap handling.
-        let (pc, fp) = get_pc_and_fp(context, signum);
-        let test = info.test_if_trap(pc, |handler| handler(signum, siginfo, context));
+        let faulting_addr = match signum {
+            libc::SIGSEGV | libc::SIGBUS => Some((*siginfo).si_addr() as usize),
+            _ => None,
+        };
+        let regs = get_trap_registers(context, signum);
+        let test = info.test_if_trap(regs, faulting_addr, |handler| {
+            handler(signum, siginfo, context)
+        });
 
         // Figure out what to do based on the result of this handling of
         // the trap. Note that our sentinel value of 1 means that the
         // exception was handled by a custom exception handler, so we
         // keep executing.
-        let (jmp_buf, trap) = match test {
-            TrapTest::NotWasm => return false,
+        let jmp_buf = match test {
+            TrapTest::NotWasm => {
+                if let Some(faulting_addr) = faulting_addr {
+                    let start = info.async_guard_range.start;
+                    let end = info.async_guard_range.end;
+                    if start as usize <= faulting_addr && faulting_addr < end as usize {
+                        abort_stack_overflow();
+                    }
+                }
+                return false;
+            }
             TrapTest::HandledByEmbedder => return true,
-            TrapTest::Trap { jmp_buf, trap } => (jmp_buf, trap),
+            TrapTest::Trap { jmp_buf } => jmp_buf,
         };
-        let faulting_addr = match signum {
-            libc::SIGSEGV | libc::SIGBUS => Some((*siginfo).si_addr() as usize),
-            _ => None,
-        };
-        info.set_jit_trap(pc, fp, faulting_addr, trap);
         // On macOS this is a bit special, unfortunately. If we were to
         // `siglongjmp` out of the signal handler that notably does
         // *not* reset the sigaltstack state of our signal handler. This
@@ -226,6 +237,15 @@ unsafe extern "C" fn trap_handler(
         return;
     }
 
+    delegate_signal_to_previous_handler(previous, signum, siginfo, context)
+}
+
+pub unsafe fn delegate_signal_to_previous_handler(
+    previous: *const libc::sigaction,
+    signum: libc::c_int,
+    siginfo: *mut libc::siginfo_t,
+    context: *mut libc::c_void,
+) {
     // This signal is not for any compiled wasm code we expect, so we
     // need to forward the signal to the next handler. If there is no
     // next handler (SIG_IGN or SIG_DFL), then it's time to crash. To do
@@ -247,20 +267,30 @@ unsafe extern "C" fn trap_handler(
     }
 }
 
-unsafe fn get_pc_and_fp(cx: *mut libc::c_void, _signum: libc::c_int) -> (*const u8, usize) {
+pub fn abort_stack_overflow() -> ! {
+    unsafe {
+        let msg = "execution on async fiber has overflowed its stack";
+        libc::write(libc::STDERR_FILENO, msg.as_ptr().cast(), msg.len());
+        libc::abort();
+    }
+}
+
+#[allow(clippy::cast_possible_truncation)] // too fiddly to handle and wouldn't
+                                           // help much anyway
+unsafe fn get_trap_registers(cx: *mut libc::c_void, _signum: libc::c_int) -> TrapRegisters {
     cfg_if::cfg_if! {
         if #[cfg(all(any(target_os = "linux", target_os = "android"), target_arch = "x86_64"))] {
             let cx = &*(cx as *const libc::ucontext_t);
-            (
-                cx.uc_mcontext.gregs[libc::REG_RIP as usize] as *const u8,
-                cx.uc_mcontext.gregs[libc::REG_RBP as usize] as usize
-            )
+            TrapRegisters {
+                pc: cx.uc_mcontext.gregs[libc::REG_RIP as usize] as usize,
+                fp: cx.uc_mcontext.gregs[libc::REG_RBP as usize] as usize,
+            }
         } else if #[cfg(all(any(target_os = "linux", target_os = "android"), target_arch = "aarch64"))] {
             let cx = &*(cx as *const libc::ucontext_t);
-            (
-                cx.uc_mcontext.pc as *const u8,
-                cx.uc_mcontext.regs[29] as usize,
-            )
+            TrapRegisters {
+                pc: cx.uc_mcontext.pc as usize,
+                fp: cx.uc_mcontext.regs[29] as usize,
+            }
         } else if #[cfg(all(target_os = "linux", target_arch = "s390x"))] {
             // On s390x, SIGILL and SIGFPE are delivered with the PSW address
             // pointing *after* the faulting instruction, while SIGSEGV and
@@ -277,46 +307,46 @@ unsafe fn get_pc_and_fp(cx: *mut libc::c_void, _signum: libc::c_int) -> (*const 
                 _ => 0,
             };
             let cx = &*(cx as *const libc::ucontext_t);
-            (
-                (cx.uc_mcontext.psw.addr - trap_offset) as *const u8,
-                *(cx.uc_mcontext.gregs[15] as *const usize),
-            )
+            TrapRegisters {
+                pc: (cx.uc_mcontext.psw.addr - trap_offset) as usize,
+                fp: *(cx.uc_mcontext.gregs[15] as *const usize),
+            }
         } else if #[cfg(all(target_os = "macos", target_arch = "x86_64"))] {
             let cx = &*(cx as *const libc::ucontext_t);
-            (
-                (*cx.uc_mcontext).__ss.__rip as *const u8,
-                (*cx.uc_mcontext).__ss.__rbp as usize,
-            )
+            TrapRegisters {
+                pc: (*cx.uc_mcontext).__ss.__rip as usize,
+                fp: (*cx.uc_mcontext).__ss.__rbp as usize,
+            }
         } else if #[cfg(all(target_os = "macos", target_arch = "aarch64"))] {
             let cx = &*(cx as *const libc::ucontext_t);
-            (
-                (*cx.uc_mcontext).__ss.__pc as *const u8,
-                (*cx.uc_mcontext).__ss.__fp as usize,
-            )
+            TrapRegisters {
+                pc: (*cx.uc_mcontext).__ss.__pc as usize,
+                fp: (*cx.uc_mcontext).__ss.__fp as usize,
+            }
         } else if #[cfg(all(target_os = "freebsd", target_arch = "x86_64"))] {
             let cx = &*(cx as *const libc::ucontext_t);
-            (
-                cx.uc_mcontext.mc_rip as *const u8,
-                cx.uc_mcontext.mc_rbp as usize,
-            )
+            TrapRegisters {
+                pc: cx.uc_mcontext.mc_rip as usize,
+                fp: cx.uc_mcontext.mc_rbp as usize,
+            }
         } else if #[cfg(all(target_os = "linux", target_arch = "riscv64"))] {
             let cx = &*(cx as *const libc::ucontext_t);
-            (
-                cx.uc_mcontext.__gregs[libc::REG_PC] as *const u8,
-                cx.uc_mcontext.__gregs[libc::REG_S0] as usize,
-            )
+            TrapRegisters {
+                pc: cx.uc_mcontext.__gregs[libc::REG_PC] as usize,
+                fp: cx.uc_mcontext.__gregs[libc::REG_S0] as usize,
+            }
         } else if #[cfg(all(target_os = "freebsd", target_arch = "aarch64"))] {
             let cx = &*(cx as *const libc::mcontext_t);
-            (
-                cx.mc_gpregs.gp_elr as *const u8,
-                cx.mc_gpregs.gp_x[29] as usize,
-            )
+            TrapRegisters {
+                pc: cx.mc_gpregs.gp_elr as usize,
+                fp: cx.mc_gpregs.gp_x[29] as usize,
+            }
         } else if #[cfg(all(target_os = "openbsd", target_arch = "x86_64"))] {
             let cx = &*(cx as *const libc::ucontext_t);
-            (
-                cx.sc_rip as *const u8,
-                cx.sc_rbp as usize,
-            )
+            TrapRegisters {
+                pc: cx.sc_rip as usize,
+                fp: cx.sc_rbp as usize,
+            }
         }
         else {
             compile_error!("unsupported platform");

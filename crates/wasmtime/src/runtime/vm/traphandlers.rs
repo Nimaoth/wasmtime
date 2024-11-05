@@ -17,6 +17,7 @@ use crate::runtime::vm::{Instance, VMContext, VMRuntimeLimits};
 use crate::sync::RwLock;
 use core::cell::{Cell, UnsafeCell};
 use core::mem::MaybeUninit;
+use core::ops::Range;
 use core::ptr;
 
 pub use self::backtrace::Backtrace;
@@ -219,6 +220,11 @@ impl From<wasmtime_environ::Trap> for TrapReason {
     }
 }
 
+pub(crate) struct TrapRegisters {
+    pub pc: usize,
+    pub fp: usize,
+}
+
 /// Return value from `test_if_trap`.
 pub(crate) enum TrapTest {
     /// Not a wasm trap, need to delegate to whatever process handler is next.
@@ -230,8 +236,6 @@ pub(crate) enum TrapTest {
     Trap {
         /// How to longjmp back to the original wasm frame.
         jmp_buf: *const u8,
-        /// The trap code of this trap.
-        trap: wasmtime_environ::Trap,
     },
 }
 
@@ -243,6 +247,7 @@ pub unsafe fn catch_traps<F>(
     signal_handler: Option<*const SignalHandler<'static>>,
     capture_backtrace: bool,
     capture_coredump: bool,
+    async_guard_range: Range<*mut u8>,
     caller: *mut VMContext,
     mut closure: F,
 ) -> Result<(), Box<Trap>>
@@ -251,15 +256,21 @@ where
 {
     let limits = Instance::from_vmctx(caller, |i| i.runtime_limits());
 
-    let result = CallThreadState::new(signal_handler, capture_backtrace, capture_coredump, *limits)
-        .with(|cx| {
-            traphandlers::wasmtime_setjmp(
-                cx.jmp_buf.as_ptr(),
-                call_closure::<F>,
-                &mut closure as *mut F as *mut u8,
-                caller,
-            )
-        });
+    let result = CallThreadState::new(
+        signal_handler,
+        capture_backtrace,
+        capture_coredump,
+        *limits,
+        async_guard_range,
+    )
+    .with(|cx| {
+        traphandlers::wasmtime_setjmp(
+            cx.jmp_buf.as_ptr(),
+            call_closure::<F>,
+            &mut closure as *mut F as *mut u8,
+            caller,
+        )
+    });
 
     return match result {
         Ok(x) => Ok(x),
@@ -299,6 +310,8 @@ mod call_thread_state {
         pub(crate) limits: *const VMRuntimeLimits,
 
         pub(super) prev: Cell<tls::Ptr>,
+        #[cfg_attr(any(windows, miri), allow(dead_code))]
+        pub(crate) async_guard_range: Range<*mut u8>,
 
         // The values of `VMRuntimeLimits::last_wasm_{exit_{pc,fp},entry_sp}`
         // for the *previous* `CallThreadState` for this same store/limits. Our
@@ -330,6 +343,7 @@ mod call_thread_state {
             capture_backtrace: bool,
             capture_coredump: bool,
             limits: *const VMRuntimeLimits,
+            async_guard_range: Range<*mut u8>,
         ) -> CallThreadState {
             let _ = capture_coredump;
 
@@ -341,6 +355,7 @@ mod call_thread_state {
                 #[cfg(feature = "coredump")]
                 capture_coredump,
                 limits,
+                async_guard_range,
                 prev: Cell::new(ptr::null()),
                 old_last_wasm_exit_fp: Cell::new(unsafe { *(*limits).last_wasm_exit_fp.get() }),
                 old_last_wasm_exit_pc: Cell::new(unsafe { *(*limits).last_wasm_exit_pc.get() }),
@@ -455,7 +470,8 @@ impl CallThreadState {
     #[cfg_attr(miri, allow(dead_code))] // miri doesn't handle traps yet
     pub(crate) fn test_if_trap(
         &self,
-        pc: *const u8,
+        regs: TrapRegisters,
+        faulting_addr: Option<usize>,
         call_handler: impl Fn(&SignalHandler) -> bool,
     ) -> TrapTest {
         // If we haven't even started to handle traps yet, bail out.
@@ -473,7 +489,7 @@ impl CallThreadState {
         }
 
         // If this fault wasn't in wasm code, then it's not our problem
-        let Some((code, text_offset)) = lookup_code(pc as usize) else {
+        let Some((code, text_offset)) = lookup_code(regs.pc) else {
             return TrapTest::NotWasm;
         };
 
@@ -481,11 +497,12 @@ impl CallThreadState {
             return TrapTest::NotWasm;
         };
 
+        self.set_jit_trap(regs, faulting_addr, trap);
+
         // If all that passed then this is indeed a wasm trap, so return the
         // `jmp_buf` passed to `wasmtime_longjmp` to resume.
         TrapTest::Trap {
             jmp_buf: self.take_jmp_buf(),
-            trap,
         }
     }
 
@@ -496,17 +513,16 @@ impl CallThreadState {
     #[cfg_attr(miri, allow(dead_code))] // miri doesn't handle traps yet
     pub(crate) fn set_jit_trap(
         &self,
-        pc: *const u8,
-        fp: usize,
+        TrapRegisters { pc, fp, .. }: TrapRegisters,
         faulting_addr: Option<usize>,
         trap: wasmtime_environ::Trap,
     ) {
-        let backtrace = self.capture_backtrace(self.limits, Some((pc as usize, fp)));
-        let coredump = self.capture_coredump(self.limits, Some((pc as usize, fp)));
+        let backtrace = self.capture_backtrace(self.limits, Some((pc, fp)));
+        let coredump = self.capture_coredump(self.limits, Some((pc, fp)));
         unsafe {
             (*self.unwind.get()).as_mut_ptr().write((
                 UnwindReason::Trap(TrapReason::Jit {
-                    pc: pc as usize,
+                    pc,
                     faulting_addr,
                     trap,
                 }),
@@ -528,7 +544,7 @@ impl CallThreadState {
         Some(unsafe { Backtrace::new_with_trap_state(limits, self, trap_pc_and_fp) })
     }
 
-    pub(crate) fn iter<'a>(&'a self) -> impl Iterator<Item = &Self> + 'a {
+    pub(crate) fn iter<'a>(&'a self) -> impl Iterator<Item = &'a Self> + 'a {
         let mut state = Some(self);
         core::iter::from_fn(move || {
             let this = state?;

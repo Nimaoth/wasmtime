@@ -1,7 +1,6 @@
 use crate::ir::{MemFlags, TrapCode};
 use crate::isa::s390x::inst::*;
 use crate::isa::s390x::settings as s390x_settings;
-use smallvec::smallvec;
 
 #[cfg(test)]
 fn simm20_zero() -> SImm20 {
@@ -2080,7 +2079,7 @@ fn test_s390x_binemit() {
             rn: gpr(5),
             rm: gpr(6),
             cond: Cond::from_mask(8),
-            trap_code: TrapCode::StackOverflow,
+            trap_code: TrapCode::STACK_OVERFLOW,
         },
         "B9728056",
         "crte %r5, %r6",
@@ -2091,7 +2090,7 @@ fn test_s390x_binemit() {
             rn: gpr(5),
             rm: gpr(6),
             cond: Cond::from_mask(8),
-            trap_code: TrapCode::StackOverflow,
+            trap_code: TrapCode::STACK_OVERFLOW,
         },
         "B9608056",
         "cgrte %r5, %r6",
@@ -2102,7 +2101,7 @@ fn test_s390x_binemit() {
             rn: gpr(5),
             rm: gpr(6),
             cond: Cond::from_mask(8),
-            trap_code: TrapCode::StackOverflow,
+            trap_code: TrapCode::STACK_OVERFLOW,
         },
         "B9738056",
         "clrte %r5, %r6",
@@ -2113,7 +2112,7 @@ fn test_s390x_binemit() {
             rn: gpr(5),
             rm: gpr(6),
             cond: Cond::from_mask(8),
-            trap_code: TrapCode::StackOverflow,
+            trap_code: TrapCode::STACK_OVERFLOW,
         },
         "B9618056",
         "clgrte %r5, %r6",
@@ -2124,7 +2123,7 @@ fn test_s390x_binemit() {
             rn: gpr(7),
             imm: -32768,
             cond: Cond::from_mask(8),
-            trap_code: TrapCode::StackOverflow,
+            trap_code: TrapCode::STACK_OVERFLOW,
         },
         "EC7080008072",
         "cite %r7, -32768",
@@ -2135,7 +2134,7 @@ fn test_s390x_binemit() {
             rn: gpr(7),
             imm: 32767,
             cond: Cond::from_mask(8),
-            trap_code: TrapCode::StackOverflow,
+            trap_code: TrapCode::STACK_OVERFLOW,
         },
         "EC707FFF8072",
         "cite %r7, 32767",
@@ -2146,7 +2145,7 @@ fn test_s390x_binemit() {
             rn: gpr(7),
             imm: -32768,
             cond: Cond::from_mask(8),
-            trap_code: TrapCode::StackOverflow,
+            trap_code: TrapCode::STACK_OVERFLOW,
         },
         "EC7080008070",
         "cgite %r7, -32768",
@@ -2157,7 +2156,7 @@ fn test_s390x_binemit() {
             rn: gpr(7),
             imm: 32767,
             cond: Cond::from_mask(8),
-            trap_code: TrapCode::StackOverflow,
+            trap_code: TrapCode::STACK_OVERFLOW,
         },
         "EC707FFF8070",
         "cgite %r7, 32767",
@@ -2168,7 +2167,7 @@ fn test_s390x_binemit() {
             rn: gpr(7),
             imm: 0,
             cond: Cond::from_mask(8),
-            trap_code: TrapCode::StackOverflow,
+            trap_code: TrapCode::STACK_OVERFLOW,
         },
         "EC7000008073",
         "clfite %r7, 0",
@@ -2179,7 +2178,7 @@ fn test_s390x_binemit() {
             rn: gpr(7),
             imm: 65535,
             cond: Cond::from_mask(8),
-            trap_code: TrapCode::StackOverflow,
+            trap_code: TrapCode::STACK_OVERFLOW,
         },
         "EC70FFFF8073",
         "clfite %r7, 65535",
@@ -2190,7 +2189,7 @@ fn test_s390x_binemit() {
             rn: gpr(7),
             imm: 0,
             cond: Cond::from_mask(8),
-            trap_code: TrapCode::StackOverflow,
+            trap_code: TrapCode::STACK_OVERFLOW,
         },
         "EC7000008071",
         "clgite %r7, 0",
@@ -2201,7 +2200,7 @@ fn test_s390x_binemit() {
             rn: gpr(7),
             imm: 65535,
             cond: Cond::from_mask(8),
-            trap_code: TrapCode::StackOverflow,
+            trap_code: TrapCode::STACK_OVERFLOW,
         },
         "EC70FFFF8071",
         "clgite %r7, 65535",
@@ -6984,16 +6983,10 @@ fn test_s390x_binemit() {
     insns.push((
         Inst::Call {
             link: writable_gpr(14),
-            info: Box::new(CallInfo {
-                dest: ExternalName::testcase("test0"),
-                uses: smallvec![],
-                defs: smallvec![],
-                clobbers: PRegSet::empty(),
-                callee_pop_size: 0,
-                caller_callconv: CallConv::SystemV,
-                callee_callconv: CallConv::SystemV,
-                tls_symbol: None,
-            }),
+            info: Box::new(CallInfo::empty(
+                ExternalName::testcase("test0"),
+                CallConv::SystemV,
+            )),
         },
         "C0E500000000",
         "brasl %r14, %test0",
@@ -7002,15 +6995,7 @@ fn test_s390x_binemit() {
     insns.push((
         Inst::CallInd {
             link: writable_gpr(14),
-            info: Box::new(CallIndInfo {
-                rn: gpr(1),
-                uses: smallvec![],
-                defs: smallvec![],
-                clobbers: PRegSet::empty(),
-                callee_pop_size: 0,
-                caller_callconv: CallConv::SystemV,
-                callee_callconv: CallConv::SystemV,
-            }),
+            info: Box::new(CallInfo::empty(gpr(1), CallConv::SystemV)),
         },
         "0DE1",
         "basr %r14, %r1",
@@ -7022,7 +7007,7 @@ fn test_s390x_binemit() {
 
     insns.push((
         Inst::Trap {
-            trap_code: TrapCode::StackOverflow,
+            trap_code: TrapCode::STACK_OVERFLOW,
         },
         "0000",
         ".word 0x0000 # trap=stk_ovf",
@@ -7030,7 +7015,7 @@ fn test_s390x_binemit() {
     insns.push((
         Inst::TrapIf {
             cond: Cond::from_mask(1),
-            trap_code: TrapCode::StackOverflow,
+            trap_code: TrapCode::STACK_OVERFLOW,
         },
         "C01400000001",
         "jgo .+2 # trap=stk_ovf",
@@ -13359,10 +13344,7 @@ fn test_s390x_binemit() {
 
     let emit_info = EmitInfo::new(isa_flags);
     for (insn, expected_encoding, expected_printing) in insns {
-        println!(
-            "S390x: {:?}, {}, {}",
-            insn, expected_encoding, expected_printing
-        );
+        println!("S390x: {insn:?}, {expected_encoding}, {expected_printing}");
 
         // Check the printed text is as expected.
         let actual_printing = insn.print_with_state(&mut EmitState::default());

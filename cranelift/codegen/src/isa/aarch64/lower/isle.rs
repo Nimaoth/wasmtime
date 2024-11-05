@@ -7,16 +7,15 @@ use generated_code::Context;
 // Types that the generated ISLE code uses via `use super::*`.
 use super::{
     fp_reg, lower_condcode, lower_fp_condcode, stack_reg, writable_link_reg, writable_zero_reg,
-    zero_reg, ASIMDFPModImm, ASIMDMovModImm, BranchTarget, CallIndInfo, CallInfo, Cond, CondBrKind,
-    ExtendOp, FPUOpRI, FPUOpRIMod, FloatCC, Imm12, ImmLogic, ImmShift, Inst as MInst, IntCC,
-    MachLabel, MemLabel, MoveWideConst, MoveWideOp, Opcode, OperandSize, Reg, SImm9, ScalarSize,
+    zero_reg, ASIMDFPModImm, ASIMDMovModImm, BranchTarget, CallInfo, Cond, CondBrKind, ExtendOp,
+    FPUOpRI, FPUOpRIMod, FloatCC, Imm12, ImmLogic, ImmShift, Inst as MInst, IntCC, MachLabel,
+    MemLabel, MoveWideConst, MoveWideOp, Opcode, OperandSize, Reg, SImm9, ScalarSize,
     ShiftOpAndAmt, UImm12Scaled, UImm5, VecMisc2, VectorSize, NZCV,
 };
 use crate::ir::{condcodes, ArgumentExtension};
 use crate::isa;
 use crate::isa::aarch64::inst::{FPULeftShiftImm, FPURightShiftImm, ReturnCallInfo};
 use crate::isa::aarch64::AArch64Backend;
-use crate::isle_common_prelude_methods;
 use crate::machinst::isle::*;
 use crate::{
     binemit::CodeOffset,
@@ -35,9 +34,10 @@ use regalloc2::PReg;
 use std::boxed::Box;
 use std::vec::Vec;
 
-type BoxCallInfo = Box<CallInfo>;
-type BoxCallIndInfo = Box<CallIndInfo>;
-type BoxReturnCallInfo = Box<ReturnCallInfo>;
+type BoxCallInfo = Box<CallInfo<ExternalName>>;
+type BoxCallIndInfo = Box<CallInfo<Reg>>;
+type BoxReturnCallInfo = Box<ReturnCallInfo<ExternalName>>;
+type BoxReturnCallIndInfo = Box<ReturnCallInfo<Reg>>;
 type VecMachLabel = Vec<MachLabel>;
 type BoxExternalName = Box<ExternalName>;
 type VecArgPair = Vec<ArgPair>;
@@ -73,66 +73,7 @@ pub struct ExtendedValue {
 
 impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
     isle_lower_prelude_methods!();
-    isle_prelude_caller_methods!(
-        crate::isa::aarch64::abi::AArch64MachineDeps,
-        AArch64CallSite
-    );
-
-    fn gen_return_call(
-        &mut self,
-        callee_sig: SigRef,
-        callee: ExternalName,
-        distance: RelocDistance,
-        args: ValueSlice,
-    ) -> InstOutput {
-        let caller_conv = isa::CallConv::Tail;
-        debug_assert_eq!(
-            self.lower_ctx.abi().call_conv(self.lower_ctx.sigs()),
-            caller_conv,
-            "Can only do `return_call`s from within a `tail` calling convention function"
-        );
-
-        let call_site = AArch64CallSite::from_func(
-            self.lower_ctx.sigs(),
-            callee_sig,
-            &callee,
-            IsTailCall::Yes,
-            distance,
-            caller_conv,
-            self.backend.flags().clone(),
-        );
-        call_site.emit_return_call(self.lower_ctx, args, &self.backend.isa_flags);
-
-        InstOutput::new()
-    }
-
-    fn gen_return_call_indirect(
-        &mut self,
-        callee_sig: SigRef,
-        callee: Value,
-        args: ValueSlice,
-    ) -> InstOutput {
-        let caller_conv = isa::CallConv::Tail;
-        debug_assert_eq!(
-            self.lower_ctx.abi().call_conv(self.lower_ctx.sigs()),
-            caller_conv,
-            "Can only do `return_call`s from within a `tail` calling convention function"
-        );
-
-        let callee = self.put_in_reg(callee);
-
-        let call_site = AArch64CallSite::from_ptr(
-            self.lower_ctx.sigs(),
-            callee_sig,
-            callee,
-            IsTailCall::Yes,
-            caller_conv,
-            self.backend.flags().clone(),
-        );
-        call_site.emit_return_call(self.lower_ctx, args, &self.backend.isa_flags);
-
-        InstOutput::new()
-    }
+    isle_prelude_caller_methods!(AArch64CallSite);
 
     fn sign_return_address_disabled(&mut self) -> Option<()> {
         if self.backend.isa_flags.sign_return_address() {
@@ -148,6 +89,10 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
         } else {
             None
         }
+    }
+
+    fn use_fp16(&mut self) -> bool {
+        self.backend.isa_flags.has_fp16()
     }
 
     fn move_wide_const_from_u64(&mut self, ty: Type, n: u64) -> Option<MoveWideConst> {
@@ -227,7 +172,7 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
 
     fn integral_ty(&mut self, ty: Type) -> Option<Type> {
         match ty {
-            I8 | I16 | I32 | I64 | R64 => Some(ty),
+            I8 | I16 | I32 | I64 => Some(ty),
             _ => None,
         }
     }

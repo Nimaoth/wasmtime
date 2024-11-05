@@ -1,9 +1,9 @@
 use crate::prelude::*;
 use core::fmt::{self, Display, Write};
 use wasmtime_environ::{
-    EngineOrModuleTypeIndex, EntityType, Global, Memory, ModuleTypes, Table, TypeTrace,
-    VMSharedTypeIndex, WasmArrayType, WasmCompositeType, WasmFieldType, WasmFuncType, WasmHeapType,
-    WasmRefType, WasmStorageType, WasmStructType, WasmSubType, WasmValType,
+    EngineOrModuleTypeIndex, EntityType, Global, IndexType, Limits, Memory, ModuleTypes, Table,
+    TypeTrace, VMSharedTypeIndex, WasmArrayType, WasmCompositeType, WasmFieldType, WasmFuncType,
+    WasmHeapType, WasmRefType, WasmStorageType, WasmStructType, WasmSubType, WasmValType,
 };
 
 use crate::{type_registry::RegisteredType, Engine};
@@ -81,7 +81,7 @@ impl Finality {
 #[derive(Clone, Hash)]
 pub enum ValType {
     // NB: the ordering of variants here is intended to match the ordering in
-    // `wasmtime_types::WasmType` to help improve codegen when converting.
+    // `wasmtime_environ::WasmType` to help improve codegen when converting.
     //
     /// Signed 32 bit integer.
     I32,
@@ -139,8 +139,14 @@ impl ValType {
     /// The `anyref` type, aka `(ref null any)`.
     pub const ANYREF: Self = ValType::Ref(RefType::ANYREF);
 
+    /// The `eqref` type, aka `(ref null eq)`.
+    pub const EQREF: Self = ValType::Ref(RefType::EQREF);
+
     /// The `i31ref` type, aka `(ref null i31)`.
     pub const I31REF: Self = ValType::Ref(RefType::I31REF);
+
+    /// The `arrayref` type, aka `(ref null array)`.
+    pub const ARRAYREF: Self = ValType::Ref(RefType::ARRAYREF);
 
     /// The `structref` type, aka `(ref null struct)`.
     pub const STRUCTREF: Self = ValType::Ref(RefType::STRUCTREF);
@@ -401,10 +407,22 @@ impl RefType {
         heap_type: HeapType::Any,
     };
 
+    /// The `eqref` type, aka `(ref null eq)`.
+    pub const EQREF: Self = RefType {
+        is_nullable: true,
+        heap_type: HeapType::Eq,
+    };
+
     /// The `i31ref` type, aka `(ref null i31)`.
     pub const I31REF: Self = RefType {
         is_nullable: true,
         heap_type: HeapType::I31,
+    };
+
+    /// The `arrayref` type, aka `(ref null array)`.
+    pub const ARRAYREF: Self = RefType {
+        is_nullable: true,
+        heap_type: HeapType::Array,
     };
 
     /// The `structref` type, aka `(ref null struct)`.
@@ -1361,6 +1379,23 @@ impl StorageType {
             Self::ValType(v) => WasmStorageType::Val(v.to_wasm_type()),
         }
     }
+
+    /// The byte size of this type, if it has a defined size in the spec.
+    ///
+    /// See
+    /// https://webassembly.github.io/gc/core/syntax/types.html#bitwidth-fieldtype
+    /// and
+    /// https://webassembly.github.io/gc/core/syntax/types.html#bitwidth-valtype
+    pub(crate) fn data_byte_size(&self) -> Option<u32> {
+        match self {
+            StorageType::I8 => Some(1),
+            StorageType::I16 => Some(2),
+            StorageType::ValType(ValType::I32 | ValType::F32) => Some(4),
+            StorageType::ValType(ValType::I64 | ValType::F64) => Some(8),
+            StorageType::ValType(ValType::V128) => Some(16),
+            StorageType::ValType(ValType::Ref(_)) => None,
+        }
+    }
 }
 
 /// The type of a `struct` field or an `array`'s elements.
@@ -1751,6 +1786,14 @@ pub struct ArrayType {
     registered_type: RegisteredType,
 }
 
+impl fmt::Display for ArrayType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let field_ty = self.field_type();
+        write!(f, "(array (field {field_ty}))")?;
+        Ok(())
+    }
+}
+
 impl ArrayType {
     /// Construct a new `ArrayType` with the given field type's mutability and
     /// storage type.
@@ -1909,6 +1952,10 @@ impl ArrayType {
 
     pub(crate) fn comes_from_same_engine(&self, engine: &Engine) -> bool {
         Engine::same(self.registered_type.engine(), engine)
+    }
+
+    pub(crate) fn registered_type(&self) -> &RegisteredType {
+        &self.registered_type
     }
 
     pub(crate) fn type_index(&self) -> VMSharedTypeIndex {
@@ -2392,21 +2439,56 @@ impl TableType {
     /// Creates a new table descriptor which will contain the specified
     /// `element` and have the `limits` applied to its length.
     pub fn new(element: RefType, min: u32, max: Option<u32>) -> TableType {
-        let wasm_ty = element.to_wasm_type();
+        let ref_type = element.to_wasm_type();
 
         debug_assert!(
-            wasm_ty.is_canonicalized_for_runtime_usage(),
-            "should be canonicalized for runtime usage: {wasm_ty:?}"
+            ref_type.is_canonicalized_for_runtime_usage(),
+            "should be canonicalized for runtime usage: {ref_type:?}"
+        );
+
+        let limits = Limits {
+            min: u64::from(min),
+            max: max.map(|x| u64::from(x)),
+        };
+
+        TableType {
+            element,
+            ty: Table {
+                idx_type: IndexType::I32,
+                limits,
+                ref_type,
+            },
+        }
+    }
+
+    /// Crates a new descriptor for a 64-bit table.
+    ///
+    /// Note that 64-bit tables are part of the memory64 proposal for
+    /// WebAssembly which is not standardized yet.
+    pub fn new64(element: RefType, min: u64, max: Option<u64>) -> TableType {
+        let ref_type = element.to_wasm_type();
+
+        debug_assert!(
+            ref_type.is_canonicalized_for_runtime_usage(),
+            "should be canonicalized for runtime usage: {ref_type:?}"
         );
 
         TableType {
             element,
             ty: Table {
-                wasm_ty,
-                minimum: min,
-                maximum: max,
+                ref_type,
+                idx_type: IndexType::I64,
+                limits: Limits { min, max },
             },
         }
+    }
+
+    /// Returns whether or not this table is a 64-bit table.
+    ///
+    /// Note that 64-bit tables are part of the memory64 proposal for
+    /// WebAssembly which is not standardized yet.
+    pub fn is_64(&self) -> bool {
+        matches!(self.ty.idx_type, IndexType::I64)
     }
 
     /// Returns the element value type of this table.
@@ -2415,20 +2497,20 @@ impl TableType {
     }
 
     /// Returns minimum number of elements this table must have
-    pub fn minimum(&self) -> u32 {
-        self.ty.minimum
+    pub fn minimum(&self) -> u64 {
+        self.ty.limits.min
     }
 
     /// Returns the optionally-specified maximum number of elements this table
     /// can have.
     ///
     /// If this returns `None` then the table is not limited in size.
-    pub fn maximum(&self) -> Option<u32> {
-        self.ty.maximum
+    pub fn maximum(&self) -> Option<u64> {
+        self.ty.limits.max
     }
 
     pub(crate) fn from_wasmtime_table(engine: &Engine, table: &Table) -> TableType {
-        let element = RefType::from_wasm_type(engine, &table.wasm_ty);
+        let element = RefType::from_wasm_type(engine, &table.ref_type);
         TableType {
             element,
             ty: *table,
@@ -2476,10 +2558,9 @@ impl Default for MemoryTypeBuilder {
     fn default() -> Self {
         MemoryTypeBuilder {
             ty: Memory {
-                minimum: 0,
-                maximum: None,
+                idx_type: IndexType::I32,
+                limits: Limits { min: 0, max: None },
                 shared: false,
-                memory64: false,
                 page_size_log2: Memory::DEFAULT_PAGE_SIZE_LOG2,
             },
         }
@@ -2488,7 +2569,12 @@ impl Default for MemoryTypeBuilder {
 
 impl MemoryTypeBuilder {
     fn validate(&self) -> Result<()> {
-        if self.ty.maximum.map_or(false, |max| max < self.ty.minimum) {
+        if self
+            .ty
+            .limits
+            .max
+            .map_or(false, |max| max < self.ty.limits.min)
+        {
             bail!("maximum page size cannot be smaller than the minimum page size");
         }
 
@@ -2501,7 +2587,7 @@ impl MemoryTypeBuilder {
             ),
         }
 
-        if self.ty.shared && self.ty.maximum.is_none() {
+        if self.ty.shared && self.ty.limits.max.is_none() {
             bail!("shared memories must have a maximum size");
         }
 
@@ -2530,7 +2616,7 @@ impl MemoryTypeBuilder {
     ///
     /// The default minimum is `0`.
     pub fn min(&mut self, minimum: u64) -> &mut Self {
-        self.ty.minimum = minimum;
+        self.ty.limits.min = minimum;
         self
     }
 
@@ -2539,7 +2625,7 @@ impl MemoryTypeBuilder {
     ///
     /// The default maximum is `None`.
     pub fn max(&mut self, maximum: Option<u64>) -> &mut Self {
-        self.ty.maximum = maximum;
+        self.ty.limits.max = maximum;
         self
     }
 
@@ -2553,7 +2639,10 @@ impl MemoryTypeBuilder {
     /// proposal](https://github.com/WebAssembly/memory64) for WebAssembly which
     /// is not fully standardized yet.
     pub fn memory64(&mut self, memory64: bool) -> &mut Self {
-        self.ty.memory64 = memory64;
+        self.ty.idx_type = match memory64 {
+            true => IndexType::I64,
+            false => IndexType::I32,
+        };
         self
     }
 
@@ -2693,7 +2782,7 @@ impl MemoryType {
     /// Note that 64-bit memories are part of the memory64 proposal for
     /// WebAssembly which is not standardized yet.
     pub fn is_64(&self) -> bool {
-        self.ty.memory64
+        matches!(self.ty.idx_type, IndexType::I64)
     }
 
     /// Returns whether this is a shared memory or not.
@@ -2709,7 +2798,7 @@ impl MemoryType {
     /// Note that the return value, while a `u64`, will always fit into a `u32`
     /// for 32-bit memories.
     pub fn minimum(&self) -> u64 {
-        self.ty.minimum
+        self.ty.limits.min
     }
 
     /// Returns the optionally-specified maximum number of pages this memory
@@ -2720,7 +2809,7 @@ impl MemoryType {
     /// Note that the return value, while a `u64`, will always fit into a `u32`
     /// for 32-bit memories.
     pub fn maximum(&self) -> Option<u64> {
-        self.ty.maximum
+        self.ty.limits.max
     }
 
     /// This memory's page size, in bytes.

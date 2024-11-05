@@ -154,7 +154,7 @@ pub extern "C" fn wasmtime_store_epoch_deadline_callback(
             }
             #[cfg(feature = "async")]
             None if kind == WASMTIME_UPDATE_DEADLINE_YIELD => Ok(UpdateDeadline::Yield(delta)),
-            _ => panic!("unknown wasmtime_update_deadline_kind_t: {}", kind),
+            _ => panic!("unknown wasmtime_update_deadline_kind_t: {kind}"),
         }
     });
 }
@@ -180,7 +180,7 @@ pub extern "C" fn wasmtime_store_limiter(
         limiter = limiter.memory_size(memory_size as usize);
     }
     if table_elements >= 0 {
-        limiter = limiter.table_elements(table_elements as u32);
+        limiter = limiter.table_elements(table_elements as usize);
     }
     if instances >= 0 {
         limiter = limiter.instances(instances as usize);

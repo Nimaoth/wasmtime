@@ -1,9 +1,8 @@
 use crate::runtime::vm::TableElement;
 use crate::store::{AutoAssertNoGc, StoreOpaque};
-use crate::{prelude::*, StructRef};
 use crate::{
-    AnyRef, AsContext, AsContextMut, ExternRef, Func, HeapType, RefType, Rooted, RootedGcRefImpl,
-    ValType, V128,
+    prelude::*, AnyRef, ArrayRef, AsContext, AsContextMut, ExternRef, Func, HeapType, RefType,
+    Rooted, RootedGcRefImpl, StructRef, ValType, V128,
 };
 use core::ptr;
 
@@ -108,6 +107,27 @@ impl Val {
     #[inline]
     pub const fn null_any_ref() -> Val {
         Val::AnyRef(None)
+    }
+
+    /// Returns the default value for the given type, if any exists.
+    ///
+    /// Returns `None` if there is no default value for the given type (for
+    /// example, non-nullable reference types do not have a default value).
+    pub fn default_for_ty(ty: &ValType) -> Option<Val> {
+        match ty {
+            ValType::I32 => Some(Val::I32(0)),
+            ValType::I64 => Some(Val::I64(0)),
+            ValType::F32 => Some(Val::F32(0)),
+            ValType::F64 => Some(Val::F64(0)),
+            ValType::V128 => Some(Val::V128(V128::from(0))),
+            ValType::Ref(ref_ty) => {
+                if ref_ty.is_nullable() {
+                    Some(Val::null_ref(ref_ty.heap_type()))
+                } else {
+                    None
+                }
+            }
+        }
     }
 
     /// Returns the corresponding [`ValType`] for this `Val`.
@@ -236,7 +256,16 @@ impl Val {
     /// This method is unsafe for the reasons that [`ExternRef::from_raw`] and
     /// [`Func::from_raw`] are unsafe. Additionally there's no guarantee
     /// otherwise that `raw` should have the type `ty` specified.
-    pub unsafe fn from_raw(store: impl AsContextMut, raw: ValRaw, ty: ValType) -> Val {
+    pub unsafe fn from_raw(mut store: impl AsContextMut, raw: ValRaw, ty: ValType) -> Val {
+        let mut store = AutoAssertNoGc::new(store.as_context_mut().0);
+        Self::_from_raw(&mut store, raw, &ty)
+    }
+
+    pub(crate) unsafe fn _from_raw(
+        store: &mut AutoAssertNoGc<'_>,
+        raw: ValRaw,
+        ty: &ValType,
+    ) -> Val {
         match ty {
             ValType::I32 => Val::I32(raw.get_i32()),
             ValType::I64 => Val::I64(raw.get_i64()),
@@ -246,12 +275,12 @@ impl Val {
             ValType::Ref(ref_ty) => {
                 let ref_ = match ref_ty.heap_type() {
                     HeapType::Func | HeapType::ConcreteFunc(_) => {
-                        Func::from_raw(store, raw.get_funcref()).into()
+                        Func::_from_raw(store, raw.get_funcref()).into()
                     }
 
                     HeapType::NoFunc => Ref::Func(None),
 
-                    HeapType::Extern => ExternRef::from_raw(store, raw.get_externref()).into(),
+                    HeapType::Extern => ExternRef::_from_raw(store, raw.get_externref()).into(),
 
                     HeapType::NoExtern => Ref::Extern(None),
 
@@ -262,7 +291,7 @@ impl Val {
                     | HeapType::ConcreteArray(_)
                     | HeapType::Struct
                     | HeapType::ConcreteStruct(_) => {
-                        AnyRef::from_raw(store, raw.get_anyref()).into()
+                        AnyRef::_from_raw(store, raw.get_anyref()).into()
                     }
 
                     HeapType::None => Ref::Any(None),
@@ -483,14 +512,28 @@ impl From<Option<Rooted<AnyRef>>> for Val {
 impl From<Rooted<StructRef>> for Val {
     #[inline]
     fn from(val: Rooted<StructRef>) -> Val {
-        Val::AnyRef(Some(val.unchecked_cast()))
+        Val::AnyRef(Some(val.into()))
     }
 }
 
 impl From<Option<Rooted<StructRef>>> for Val {
     #[inline]
     fn from(val: Option<Rooted<StructRef>>) -> Val {
-        Val::AnyRef(val.map(|s| s.unchecked_cast()))
+        Val::AnyRef(val.map(Into::into))
+    }
+}
+
+impl From<Rooted<ArrayRef>> for Val {
+    #[inline]
+    fn from(val: Rooted<ArrayRef>) -> Val {
+        Val::AnyRef(Some(val.into()))
+    }
+}
+
+impl From<Option<Rooted<ArrayRef>>> for Val {
+    #[inline]
+    fn from(val: Option<Rooted<ArrayRef>>) -> Val {
+        Val::AnyRef(val.map(Into::into))
     }
 }
 
@@ -653,14 +696,28 @@ impl From<Option<Rooted<AnyRef>>> for Ref {
 impl From<Rooted<StructRef>> for Ref {
     #[inline]
     fn from(e: Rooted<StructRef>) -> Ref {
-        Ref::Any(Some(e.unchecked_cast::<AnyRef>()))
+        Ref::Any(Some(e.into()))
     }
 }
 
 impl From<Option<Rooted<StructRef>>> for Ref {
     #[inline]
     fn from(e: Option<Rooted<StructRef>>) -> Ref {
-        Ref::Any(e.map(|e| e.unchecked_cast::<AnyRef>()))
+        Ref::Any(e.map(Into::into))
+    }
+}
+
+impl From<Rooted<ArrayRef>> for Ref {
+    #[inline]
+    fn from(e: Rooted<ArrayRef>) -> Ref {
+        Ref::Any(Some(e.into()))
+    }
+}
+
+impl From<Option<Rooted<ArrayRef>>> for Ref {
+    #[inline]
+    fn from(e: Option<Rooted<ArrayRef>>) -> Ref {
+        Ref::Any(e.map(Into::into))
     }
 }
 
@@ -854,13 +911,18 @@ impl Ref {
             (Ref::Any(_), HeapType::Any) => true,
             (Ref::Any(Some(a)), HeapType::I31) => a._is_i31(store)?,
             (Ref::Any(Some(a)), HeapType::Struct) => a._is_struct(store)?,
-            (Ref::Any(Some(a)), HeapType::ConcreteStruct(ty)) => match a._as_struct(store)? {
+            (Ref::Any(Some(a)), HeapType::ConcreteStruct(_ty)) => match a._as_struct(store)? {
                 None => false,
-                Some(s) => s._matches_ty(store, ty)?,
+                #[cfg_attr(not(feature = "gc"), allow(unreachable_patterns))]
+                Some(s) => s._matches_ty(store, _ty)?,
             },
             (Ref::Any(Some(_)), HeapType::Eq) => todo!("eqref"),
-            (Ref::Any(Some(_)), HeapType::Array) => todo!("wasm GC arrays"),
-            (Ref::Any(Some(_)), HeapType::ConcreteArray(_)) => todo!("wasm GC arrays"),
+            (Ref::Any(Some(a)), HeapType::Array) => a._is_array(store)?,
+            (Ref::Any(Some(a)), HeapType::ConcreteArray(_ty)) => match a._as_array(store)? {
+                None => false,
+                #[cfg_attr(not(feature = "gc"), allow(unreachable_patterns))]
+                Some(a) => a._matches_ty(store, _ty)?,
+            },
             (
                 Ref::Any(None),
                 HeapType::None
@@ -927,6 +989,7 @@ impl Ref {
                     assert!(ty.is_nullable());
                     Ok(TableElement::GcRef(None))
                 }
+                #[cfg_attr(not(feature = "gc"), allow(unreachable_patterns))]
                 Some(e) => {
                     let gc_ref = e.try_clone_gc_ref(&mut store)?;
                     Ok(TableElement::GcRef(Some(gc_ref)))
@@ -938,6 +1001,7 @@ impl Ref {
                     assert!(ty.is_nullable());
                     Ok(TableElement::GcRef(None))
                 }
+                #[cfg_attr(not(feature = "gc"), allow(unreachable_patterns))]
                 Some(a) => {
                     let gc_ref = a.try_clone_gc_ref(&mut store)?;
                     Ok(TableElement::GcRef(Some(gc_ref)))

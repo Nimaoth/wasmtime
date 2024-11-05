@@ -8,7 +8,7 @@
 use crate::func_environ::FuncEnvironment;
 use cranelift_codegen::ir;
 use cranelift_frontend::FunctionBuilder;
-use cranelift_wasm::{WasmHeapType, WasmRefType, WasmResult, WasmValType};
+use wasmtime_environ::{GcTypeLayouts, TypeIndex, WasmRefType, WasmResult};
 
 #[cfg(feature = "gc")]
 mod enabled;
@@ -20,99 +20,53 @@ mod disabled;
 #[cfg(not(feature = "gc"))]
 use disabled as imp;
 
-/// Get the GC compiler configured for the given function environment.
-pub fn gc_compiler(func_env: &FuncEnvironment<'_>) -> Box<dyn GcCompiler> {
-    imp::gc_compiler(func_env)
-}
+// Re-export the GC compilation interface from the implementation that we chose
+// based on the compile-time features enabled.
+pub use imp::*;
 
-/// Load a `*mut VMGcRef` into a virtual register of the function environment's
-/// reference type, aka `r{32,64}`, without any GC barriers.
-///
-/// Note that a `VMGcRef` is always 4-bytes large, even when targeting
-/// 64-bit architectures.
-///
-/// Because Cranelift doesn't support using `r32` with 64-bit targets, this
-/// means that the loaded value may need to be extended.
-pub fn unbarriered_load_gc_ref(
-    func_env: &FuncEnvironment<'_>,
-    builder: &mut FunctionBuilder<'_>,
-    ty: WasmHeapType,
-    src: ir::Value,
-    flags: ir::MemFlags,
-) -> WasmResult<ir::Value> {
-    imp::unbarriered_load_gc_ref(func_env, builder, ty, src, flags)
-}
+/// How to initialize a newly-allocated array's elements.
+#[derive(Clone, Copy)]
+#[cfg_attr(not(feature = "gc"), allow(dead_code))]
+pub enum ArrayInit<'a> {
+    /// Initialize the array's elements with the given values.
+    Elems(&'a [ir::Value]),
 
-/// Store `*dst = gc_ref`, without any GC barriers.
-///
-/// `dst` is a `*mut VMGcRef`.
-///
-/// `gc_ref` is an instance of the function environment's reference type, aka
-/// `r{32,64}`.
-///
-/// Note that a `VMGcRef` is always 4-bytes large, even when targeting
-/// 64-bit architectures.
-///
-/// Because Cranelift doesn't support using `r32` with 64-bit targets, we keep
-/// `VMGcRef`s on the Wasm stack as `r64`s with the top half unset, and this
-/// means that `value` may need to be truncated.
-pub fn unbarriered_store_gc_ref(
-    func_env: &FuncEnvironment<'_>,
-    builder: &mut FunctionBuilder<'_>,
-    ty: WasmHeapType,
-    dst: ir::Value,
-    gc_ref: ir::Value,
-    flags: ir::MemFlags,
-) -> WasmResult<()> {
-    imp::unbarriered_store_gc_ref(func_env, builder, ty, dst, gc_ref, flags)
-}
-
-/// Get the index and signature of the built-in function for doing `table.grow`
-/// on GC reference tables.
-pub fn gc_ref_table_grow_builtin(
-    ty: WasmHeapType,
-    func_env: &mut FuncEnvironment<'_>,
-    func: &mut ir::Function,
-) -> WasmResult<ir::FuncRef> {
-    debug_assert!(ty.is_vmgcref_type_and_not_i31());
-    imp::gc_ref_table_grow_builtin(ty, func_env, func)
-}
-
-/// Get the index and signature of the built-in function for doing `table.fill`
-/// on GC reference tables.
-pub fn gc_ref_table_fill_builtin(
-    ty: WasmHeapType,
-    func_env: &mut FuncEnvironment<'_>,
-    func: &mut ir::Function,
-) -> WasmResult<ir::FuncRef> {
-    debug_assert!(ty.is_vmgcref_type_and_not_i31());
-    imp::gc_ref_table_fill_builtin(ty, func_env, func)
-}
-
-/// Get the index and signature of the built-in function for doing `global.get`
-/// on a GC reference global.
-pub fn gc_ref_global_get_builtin(
-    ty: WasmValType,
-    func_env: &mut FuncEnvironment<'_>,
-    func: &mut ir::Function,
-) -> WasmResult<ir::FuncRef> {
-    debug_assert!(ty.is_vmgcref_type());
-    imp::gc_ref_global_get_builtin(ty, func_env, func)
-}
-
-/// Get the index and signature of the built-in function for doing `global.set`
-/// on a GC reference global.
-pub fn gc_ref_global_set_builtin(
-    ty: WasmValType,
-    func_env: &mut FuncEnvironment<'_>,
-    func: &mut ir::Function,
-) -> WasmResult<ir::FuncRef> {
-    debug_assert!(ty.is_vmgcref_type());
-    imp::gc_ref_global_set_builtin(ty, func_env, func)
+    /// Initialize the array's elements with `elem` repeated `len` times.
+    Fill { elem: ir::Value, len: ir::Value },
 }
 
 /// A trait for different collectors to emit any GC barriers they might require.
 pub trait GcCompiler {
+    /// Get the GC type layouts for this GC compiler.
+    #[cfg_attr(not(feature = "gc"), allow(dead_code))]
+    fn layouts(&self) -> &dyn GcTypeLayouts;
+
+    /// Emit code to allocate a new array.
+    ///
+    /// The array should be of the given type and its elements initialized as
+    /// described by the given `ArrayInit`.
+    #[cfg_attr(not(feature = "gc"), allow(dead_code))]
+    fn alloc_array(
+        &mut self,
+        func_env: &mut FuncEnvironment<'_>,
+        builder: &mut FunctionBuilder<'_>,
+        array_type_index: TypeIndex,
+        init: ArrayInit<'_>,
+    ) -> WasmResult<ir::Value>;
+
+    /// Emit code to allocate a new struct.
+    ///
+    /// The struct should be of the given type and its fields initialized to the
+    /// given values.
+    #[cfg_attr(not(feature = "gc"), allow(dead_code))]
+    fn alloc_struct(
+        &mut self,
+        func_env: &mut FuncEnvironment<'_>,
+        builder: &mut FunctionBuilder<'_>,
+        struct_type_index: TypeIndex,
+        fields: &[ir::Value],
+    ) -> WasmResult<ir::Value>;
+
     /// Emit a read barrier for when we are cloning a GC reference onto the Wasm
     /// stack.
     ///
@@ -144,7 +98,7 @@ pub trait GcCompiler {
     /// * `flags`: The memory flags that should be used when accessing `src`.
     ///
     /// This method should return the cloned GC reference (an instance of
-    /// `VMGcRef`) of type `r64`.
+    /// `VMGcRef`) of type `i32`.
     fn translate_read_gc_reference(
         &mut self,
         func_env: &mut FuncEnvironment<'_>,
@@ -183,7 +137,7 @@ pub trait GcCompiler {
     ///   itself or a `*mut VMGcHeader`!
     ///
     /// * `new_val`: The new value that should be written into `dst`. This is a
-    ///   `VMGcRef` of Cranelift type `r64`; not a `*mut VMGcRef`.
+    ///   `VMGcRef` of Cranelift type `i32`; not a `*mut VMGcRef`.
     ///
     /// * `flags`: The memory flags that should be used when accessing `dst`.
     fn translate_write_gc_reference(
@@ -195,4 +149,41 @@ pub trait GcCompiler {
         new_val: ir::Value,
         flags: ir::MemFlags,
     ) -> WasmResult<()>;
+}
+
+pub mod builtins {
+    use super::*;
+
+    macro_rules! define_builtin_accessors {
+        ( $( $name:ident , )* ) => {
+            $(
+                #[inline]
+                pub fn $name(
+                    func_env: &mut FuncEnvironment<'_>,
+                    func: &mut ir::Function,
+                ) -> WasmResult<ir::FuncRef> {
+                    #[cfg(feature = "gc")]
+                    return Ok(func_env.builtin_functions.$name(func));
+
+                    #[cfg(not(feature = "gc"))]
+                    let _ = (func, func_env);
+                    #[cfg(not(feature = "gc"))]
+                    return Err(wasmtime_environ::wasm_unsupported!(
+                        "support for Wasm GC disabled at compile time because the `gc` cargo \
+                         feature was not enabled"
+                    ));
+                }
+            )*
+        };
+    }
+
+    define_builtin_accessors! {
+        table_grow_gc_ref,
+        table_fill_gc_ref,
+        array_new_data,
+        array_new_elem,
+        array_copy,
+        array_init_data,
+        array_init_elem,
+    }
 }
