@@ -279,7 +279,7 @@ impl wasmtime_component_val_t {
                 let v = v.take().into_iter()
                     .map(|v| v.into_val())
                     .collect::<Result<Vec<_>>>()?;
-                Val::List(v)
+                Val::Tuple(v)
             }
             wasmtime_component_val_t::Variant(v) => {
                 if let Some(val) = v.val {

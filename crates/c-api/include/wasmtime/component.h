@@ -139,7 +139,7 @@ typedef union wasmtime_component_val_payload_t {
   uint64_t u64;
   float f32;
   double f64;
-  uint8_t character;
+  uint32_t character;
   wasm_name_t string;
   wasmtime_component_val_vec_t list;
   wasmtime_component_val_record_field_vec_t record;
