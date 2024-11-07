@@ -660,6 +660,16 @@ pub unsafe extern "C" fn wasmtime_component_func_call(
     }
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn wasmtime_component_val_new() -> Box<wasmtime_component_val_t> {
+    Box::new(wasmtime_component_val_t::default())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn wasmtime_component_val_delete(val: *mut wasmtime_component_val_t) {
+    _ = Box::from_raw(val)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{

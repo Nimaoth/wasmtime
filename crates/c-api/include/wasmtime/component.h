@@ -228,6 +228,12 @@ wasmtime_component_func_call(
     wasmtime_component_val_t *results, size_t results_len,
     wasm_trap_t **trap_out);
 
+WASM_API_EXTERN wasmtime_component_val_t *
+wasmtime_component_val_new();
+
+WASM_API_EXTERN void
+wasmtime_component_val_delete(wasmtime_component_val_t *val);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif
