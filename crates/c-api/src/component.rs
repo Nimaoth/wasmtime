@@ -1,5 +1,4 @@
 use crate::ForeignData;
-use std::println;
 use std::ffi::c_void;
 use anyhow::{bail, Result, anyhow};
 use wasmtime::component::{Component, Func, Instance, Linker, Val};
@@ -580,15 +579,12 @@ pub extern "C" fn wasmtime_component_linker_instantiate(
     out: &mut *mut wasmtime_component_instance_t,
     trap_ret: &mut *mut wasm_trap_t,
 ) -> Option<Box<wasmtime_error_t>> {
-    // println!("wasmtime_component_linker_instantiate");
     match linker.linker.instantiate(store, &component.component) {
         Ok(instance) => {
-            println!("wasmtime_component_linker_instantiate ok");
             *out = Box::into_raw(Box::new(wasmtime_component_instance_t { instance }));
             None
         }
         Err(e) => {
-            // println!("wasmtime_component_linker_instantiate err {:?}", e);
             handle_call_error(e, trap_ret)
         }
     }
