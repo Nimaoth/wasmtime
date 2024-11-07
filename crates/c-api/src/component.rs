@@ -301,7 +301,7 @@ impl wasmtime_component_val_t {
             }
             wasmtime_component_val_t::Result(v) => {
                 let v: Result<Option<Box<Val>>, Option<Box<Val>>> = if v.error {
-                    Ok(match v.value {
+                    Err(match v.value {
                         Some(v) => Some(Box::new(v.into_val()?)),
                         None => None,
                     })
