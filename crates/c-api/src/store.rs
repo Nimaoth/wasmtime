@@ -81,7 +81,7 @@ pub struct wasmtime_store_t {
 wasmtime_c_api_macros::declare_own!(wasmtime_store_t);
 
 pub struct WasmtimeStoreData {
-    foreign: crate::ForeignData,
+    pub(crate) foreign: crate::ForeignData,
     #[cfg(feature = "wasi")]
     pub(crate) wasi: Option<wasmtime_wasi::preview1::WasiP1Ctx>,
 

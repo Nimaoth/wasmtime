@@ -200,6 +200,7 @@
 #include <wasmtime/trap.h>
 #include <wasmtime/val.h>
 #include <wasmtime/async.h>
+#include <wasmtime/component.h>
 // IWYU pragma: end_exports
 // clang-format on
 
@@ -218,7 +219,7 @@
 /**
  * \brief Wasmtime patch version number.
  */
-#define WASMTIME_VERSION_PATCH 0
+#define WASMTIME_VERSION_PATCH 1
 
 #ifdef __cplusplus
 extern "C" {
