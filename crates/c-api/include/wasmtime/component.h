@@ -200,6 +200,8 @@ typedef wasm_trap_t *(*wasmtime_component_func_callback_t)(
 
 WASM_API_EXTERN wasmtime_error_t *
 wasmtime_component_linker_func_new(wasmtime_component_linker_t *linker,
+                                    const char* env_name,
+                                    size_t env_name_len,
                                     const char* name,
                                     size_t len,
                                     wasmtime_component_func_callback_t callback,

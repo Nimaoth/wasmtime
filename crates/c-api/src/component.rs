@@ -544,26 +544,34 @@ unsafe fn c_callback_to_rust_fn<T>(
 #[no_mangle]
 pub unsafe extern "C" fn wasmtime_component_linker_func_new(
     linker: &mut wasmtime_component_linker_t,
+    env_name: *const u8,
+    env_name_len: usize,
     name: *const u8,
     len: usize,
     callback: wasmtime_component_func_callback_t,
     data: *mut c_void,
     finalizer: Option<extern "C" fn(*mut std::ffi::c_void)>,
 ) -> Option<Box<wasmtime_error_t>> {
+    let env_name = crate::slice_from_raw_parts(env_name, env_name_len);
+    let env_name = match std::str::from_utf8(env_name) {
+        Ok(env_name) => env_name,
+        Err(_) => return Some(Box::new(anyhow!("Invalid utf8").into())),
+    };
+
     let name = crate::slice_from_raw_parts(name, len);
     let name = match std::str::from_utf8(name) {
         Ok(name) => name,
         Err(_) => return Some(Box::new(anyhow!("Invalid utf8").into())),
     };
 
-    if let Some(mut instance) = linker.linker.root().get_instance("env") {
+    if let Some(mut instance) = linker.linker.root().get_instance(env_name) {
         return match instance.func_new(name, c_callback_to_rust_fn(callback, data, finalizer)) {
             Ok(_) => None,
             Err(e) => Some(Box::new(e.into())),
         };
     }
 
-    let mut instance = linker.linker.instance("env").unwrap();
+    let mut instance = linker.linker.instance(env_name).unwrap();
 
     match instance.func_new(name, c_callback_to_rust_fn(callback, data, finalizer)) {
         Ok(_) => None,
