@@ -1,17 +1,27 @@
 use crate::ForeignData;
 use std::ffi::c_void;
-use anyhow::{bail, Result, anyhow};
-use wasmtime::component::{Component, Func, Instance, Linker, Val};
+use anyhow::{Result, anyhow};
+use wasmtime::component::{Component, Func, Instance, Linker, Val, ResourceType, Resource, ResourceAny};
 use wasmtime::{AsContextMut, StoreContextMut, Store, StoreLimits,
     StoreLimitsBuilder};
 use wasmtime_wasi::{WasiView, WasiCtx};
-
 
 use crate::{
     declare_vecs, handle_call_error, handle_result, wasm_byte_vec_t, wasm_config_t, wasm_engine_t,
     wasm_name_t, wasm_trap_t, wasmtime_error_t, WasmtimeStoreData,
 };
 use std::{mem, mem::MaybeUninit, ptr, slice};
+
+pub struct ForeignDataNoFinalizer {
+    data: *mut std::ffi::c_void,
+}
+
+unsafe impl Send for ForeignDataNoFinalizer {}
+unsafe impl Sync for ForeignDataNoFinalizer {}
+
+struct CResourceType {
+    data: ForeignDataNoFinalizer
+}
 
 impl TryInto<String> for &wasm_name_t {
     type Error = anyhow::Error;
@@ -181,6 +191,44 @@ pub struct wasmtime_component_val_result_t {
     pub error: bool,
 }
 
+// #[repr(C)]
+// #[derive(Clone)]
+// pub struct wasmtime_component_resource_kind_host_t {
+//     pub user_id: usize,
+// }
+
+// #[repr(C)]
+// #[derive(Clone)]
+// pub struct wasmtime_component_resource_kind_guest_t {
+//     pub store: u64,
+//     pub instance: usize,
+//     pub id: u32,
+// }
+
+// #[repr(C)]
+// #[derive(Clone)]
+// pub struct wasmtime_component_resource_kind_uninstantiated_t {
+//     pub component: usize,
+//     pub index: u32,
+// }
+
+// #[repr(C, u8)]
+// #[derive(Clone)]
+// pub enum wasmtime_component_resource_type_t {
+//     Host(wasmtime_component_resource_kind_host_t),
+//     Guest(wasmtime_component_resource_kind_guest_t),
+//     Uninstantiated(wasmtime_component_resource_kind_uninstantiated_t),
+// }
+
+#[repr(C)]
+#[derive(Clone)]
+pub struct wasmtime_component_val_resource_t {
+    pub data: Box<ResourceAny>,
+    // pub idx: u64,
+    // pub ty: wasmtime_component_resource_type_t,
+    // pub owned: bool,
+}
+
 #[repr(C)]
 #[derive(Clone)]
 pub struct wasmtime_component_val_enum_t {
@@ -241,6 +289,7 @@ pub enum wasmtime_component_val_t {
     Option(Option<Box<wasmtime_component_val_t>>),
     Result(wasmtime_component_val_result_t),
     Flags(wasmtime_component_val_flags_vec_t),
+    Resource(wasmtime_component_val_resource_t),
 }
 
 impl wasmtime_component_val_t {
@@ -314,6 +363,31 @@ impl wasmtime_component_val_t {
             }
             wasmtime_component_val_t::Flags(flags) => {
                 Val::Flags(flags.as_slice().iter().map(|it| Ok(it.try_into()?)).collect::<Result<Vec<String>>>()?)
+            }
+            wasmtime_component_val_t::Resource(r) => {
+                // let res_any = ResourceAny {
+                //     idx: HostResourceIndex(r.idx),
+                //     ty: ResourceType {
+                //         kind: match r.ty {
+                //             wasmtime_component_resource_type_t::Host(host) => ResourceTypeKind::Host {
+                //                 id: TypeId::of::<CResourceType>(),
+                //                 user_id: host.user_id,
+                //             },
+                //             wasmtime_component_resource_type_t::Guest(guest) => ResourceTypeKind::Guest {
+                //                 id: DefinedResourceIndex(guest.id),
+                //                 instance: guest.instance,
+                //                 store: StoreId(guest.store.try_into().unwrap()),
+                //             },
+                //             wasmtime_component_resource_type_t::Uninstantiated(uninstantiated) => ResourceTypeKind::Uninstantiated {
+                //                 component: uninstantiated.component,
+                //                 index: ResourceIndex(uninstantiated.index),
+                //             },
+                //         },
+                //     },
+                //     owned: r.owned,
+                // };
+
+                Val::Resource(*r.data)
             }
         })
     }
@@ -397,7 +471,30 @@ impl wasmtime_component_val_t {
                 let flags = v.iter().map(|name| wasm_name_t::from_name(name.clone())).collect::<Vec<_>>().into();
                 wasmtime_component_val_t::Flags(flags)
             }
-            Val::Resource(_) => bail!("resource types are unimplemented"),
+            Val::Resource(r) => {
+                wasmtime_component_val_t::Resource(wasmtime_component_val_resource_t {
+                    data: Box::new(*r),
+                })
+                // wasmtime_component_val_t::Resource(wasmtime_component_val_resource_t {
+                //     idx: r.idx.as_u64(),
+                //     ty: match r.ty().kind {
+                //         // todo: id
+                //         ResourceTypeKind::Host { id: _, user_id } => wasmtime_component_resource_type_t::Host(wasmtime_component_resource_kind_host_t {
+                //             user_id: user_id,
+                //         }),
+                //         ResourceTypeKind::Guest { store, instance, id } => wasmtime_component_resource_type_t::Guest(wasmtime_component_resource_kind_guest_t {
+                //             store: store.as_raw().into(),
+                //             instance,
+                //             id: id.as_u32(),
+                //         }),
+                //         ResourceTypeKind::Uninstantiated { component, index } => wasmtime_component_resource_type_t::Uninstantiated(wasmtime_component_resource_kind_uninstantiated_t {
+                //             component,
+                //             index: index.as_u32(),
+                //         }),
+                //     },
+                //     owned: r.owned(),
+                // })
+            }
         })
     }
 }
@@ -580,6 +677,97 @@ pub unsafe extern "C" fn wasmtime_component_linker_func_new(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn wasmtime_component_linker_define_resource(
+    linker: &mut wasmtime_component_linker_t,
+    env_name: *const u8,
+    env_name_len: usize,
+    name: *const u8,
+    len: usize,
+    user_id: usize,
+    finalizer: Option<extern "C" fn(*mut std::ffi::c_void)>,
+) -> Option<Box<wasmtime_error_t>> {
+    let env_name = crate::slice_from_raw_parts(env_name, env_name_len);
+    let env_name = match std::str::from_utf8(env_name) {
+        Ok(env_name) => env_name,
+        Err(_) => return Some(Box::new(anyhow!("Invalid utf8").into())),
+    };
+
+    let name = crate::slice_from_raw_parts(name, len);
+    let name = match std::str::from_utf8(name) {
+        Ok(name) => name,
+        Err(_) => return Some(Box::new(anyhow!("Invalid utf8").into())),
+    };
+
+    let ty = ResourceType::host_user::<CResourceType>(user_id);
+
+    if let Some(mut instance) = linker.linker.root().get_instance(env_name) {
+        match instance.resource(name, ty, move |mut store, rep| {
+            let host = store.data_mut();
+            let res = Resource::<CResourceType>::new_own(rep);
+            let res = host.table.delete(res)?;
+            if let Some(f) = finalizer {
+                f(res.data.data);
+            }
+
+            Ok(())
+        }) {
+            Ok(_) => None,
+            Err(e) => Some(Box::new(e.into())),
+        }
+    } else {
+
+        let mut instance = linker.linker.instance(env_name).unwrap();
+
+        match instance.resource(name, ty, move |mut store, rep| {
+            let host = store.data_mut();
+            let res = Resource::<CResourceType>::new_own(rep);
+            let res = host.table.delete(res)?;
+            if let Some(f) = finalizer {
+                f(res.data.data);
+            }
+
+            Ok(())
+        }) {
+            Ok(_) => None,
+            Err(e) => Some(Box::new(e.into())),
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn wasmtime_component_resource_new(
+    mut store: WasmtimeStoreContextMutWasi<'_>,
+    user_id: usize,
+    resource: &mut wasmtime_component_val_t,
+    data: *mut c_void,
+) -> Option<Box<wasmtime_error_t>> {
+
+    let host = store.data_mut();
+    let res = match host.table.push(CResourceType { data: ForeignDataNoFinalizer { data } }) {
+        Ok(r) => r,
+        Err(e) => {
+            return Some(Box::new(wasmtime_error_t::from(anyhow!("Resource error: {}", e))));
+        }
+    };
+
+
+    let res_any = match ResourceAny::try_from_resource(res, store, user_id) {
+        Ok(r) => r,
+        Err(e) => return Some(Box::new(wasmtime_error_t::from(e))),
+    };
+
+    let val = Val::Resource(res_any);
+    let val = match wasmtime_component_val_t::try_from(&val) {
+        Ok(r) => r,
+        Err(e) => return Some(Box::new(wasmtime_error_t::from(e))),
+    };
+
+    *resource = val;
+
+    None
+}
+
+#[no_mangle]
 pub extern "C" fn wasmtime_component_linker_instantiate(
     linker: &wasmtime_component_linker_t,
     store: WasmtimeStoreContextMutWasi<'_>,
@@ -672,6 +860,34 @@ pub unsafe extern "C" fn wasmtime_component_val_new() -> Box<wasmtime_component_
 #[no_mangle]
 pub unsafe extern "C" fn wasmtime_component_val_delete(val: *mut wasmtime_component_val_t) {
     _ = Box::from_raw(val)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn wasmtime_component_resource_drop(
+    context: WasmtimeStoreContextMutWasi<'_>,
+    val: &mut wasmtime_component_val_t,
+) -> Option<Box<wasmtime_error_t>> {
+    match val {
+        wasmtime_component_val_t::Resource(r) => match r.data.resource_drop(context) {
+            Ok(_) => None,
+            Err(e) => Some(Box::new(wasmtime_error_t::from(e))),
+        },
+        _ => None,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn wasmtime_component_resource_dump(
+    val: &mut wasmtime_component_val_t,
+) -> wasm_name_t {
+    let str = match val {
+        wasmtime_component_val_t::Resource(r) => {
+            let res = &*r.data;
+            format!("Res({}:{}, {}, {:?})", res.idx().index(), res.idx().gen(), if res.owned() { "own" } else { "borrow" }, res.ty())
+        },
+        _ => format!("Not a resource"),
+    };
+    wasm_name_t::from_name(str)
 }
 
 #[cfg(test)]

@@ -33,6 +33,7 @@ typedef struct wasmtime_component_context wasmtime_component_context_t;
 // The tag part of wasmtime_component_val_t that specifies what variant is
 // populated in wasmtime_component_val_payload_t.
 typedef uint8_t wasmtime_component_val_kind_t;
+// typedef uint8_t wasmtime_component_resource_type_kind_t;
 
 enum wasmtime_component_val_kind_enum {
   WASMTIME_COMPONENT_VAL_KIND_BOOL = 0,
@@ -56,7 +57,14 @@ enum wasmtime_component_val_kind_enum {
   WASMTIME_COMPONENT_VAL_KIND_OPTION = 18,
   WASMTIME_COMPONENT_VAL_KIND_RESULT = 19,
   WASMTIME_COMPONENT_VAL_KIND_FLAGS = 20,
+  WASMTIME_COMPONENT_VAL_KIND_RESOURCE = 21,
 };
+
+// enum wasmtime_component_resource_type_enum {
+//   WASMTIME_COMPONENT_RESOURCE_KIND_HOST = 0,
+//   WASMTIME_COMPONENT_RESOURCE_KIND_GUEST = 1,
+//   WASMTIME_COMPONENT_RESOURCE_KIND_UNINSTANTIATED = 2,
+// };
 
 typedef struct wasmtime_component_val_t wasmtime_component_val_t;
 typedef struct wasmtime_component_val_record_field_t
@@ -127,6 +135,40 @@ typedef struct wasmtime_component_val_enum_t {
   wasm_name_t name;
 } wasmtime_component_val_enum_t;
 
+// typedef struct wasmtime_component_resource_kind_host_t {
+//   size_t user_id;
+// } wasmtime_component_resource_kind_host_t;
+
+// typedef struct wasmtime_component_resource_kind_guest_t {
+//   uint64_t store;
+//   size_t instance;
+//   uint32_t id;
+// } wasmtime_component_resource_kind_guest_t;
+
+// typedef struct wasmtime_component_resource_kind_uninstantiated_t {
+//   size_t component;
+//   uint32_t index;
+// } wasmtime_component_resource_kind_uninstantiated_t;
+
+// typedef union wasmtime_component_resource_type_payload_t {
+//   wasmtime_component_resource_kind_host_t host;
+//   wasmtime_component_resource_kind_guest_t guest;
+//   wasmtime_component_resource_kind_uninstantiated_t uninstantiated;
+// } wasmtime_component_resource_type_payload_t;
+
+// typedef struct wasmtime_component_resource_type_t {
+//   wasmtime_component_resource_type_kind_t kind;
+//   wasmtime_component_resource_type_payload_t payload;
+// } wasmtime_component_resource_type_t;
+
+typedef struct wasmtime_component_val_resource_t {
+  void* data;
+} wasmtime_component_val_resource_t;
+
+    // uint64_t idx;
+    // wasmtime_component_resource_type_t ty;
+    // bool owned;
+
 typedef union wasmtime_component_val_payload_t {
   bool boolean;
   int8_t s8;
@@ -149,6 +191,7 @@ typedef union wasmtime_component_val_payload_t {
   wasmtime_component_val_t *option;
   wasmtime_component_val_result_t result;
   wasmtime_component_val_flags_vec_t flags;
+  wasmtime_component_val_resource_t resource;
 } wasmtime_component_val_payload_t;
 
 // The tagged union for a value within the component model.
@@ -208,6 +251,21 @@ wasmtime_component_linker_func_new(wasmtime_component_linker_t *linker,
                                     void* data,
                                     void (*finalizer)(void *));
 
+WASM_API_EXTERN wasmtime_error_t *
+wasmtime_component_linker_define_resource(wasmtime_component_linker_t *linker,
+                                    const char* env_name,
+                                    size_t env_name_len,
+                                    const char* name,
+                                    size_t len,
+                                    size_t user_id,
+                                    void (*finalizer)(void *));
+
+WASM_API_EXTERN wasmtime_error_t *
+wasmtime_component_resource_new(wasmtime_component_context_t* context,
+                                size_t user_id,
+                                wasmtime_component_val_t* resource,
+                                void* data);
+
 typedef struct wasmtime_component_instance_t wasmtime_component_instance_t;
 
 WASM_API_EXTERN wasmtime_error_t *
@@ -235,6 +293,12 @@ wasmtime_component_val_new();
 
 WASM_API_EXTERN void
 wasmtime_component_val_delete(wasmtime_component_val_t *val);
+
+WASM_API_EXTERN wasmtime_error_t*
+wasmtime_component_resource_drop(wasmtime_component_context_t* context, wasmtime_component_val_t* val);
+
+WASM_API_EXTERN wasm_name_t
+wasmtime_component_resource_dump(wasmtime_component_val_t* val);
 
 #ifdef __cplusplus
 } // extern "C"
