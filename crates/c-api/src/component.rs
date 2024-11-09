@@ -191,42 +191,10 @@ pub struct wasmtime_component_val_result_t {
     pub error: bool,
 }
 
-// #[repr(C)]
-// #[derive(Clone)]
-// pub struct wasmtime_component_resource_kind_host_t {
-//     pub user_id: usize,
-// }
-
-// #[repr(C)]
-// #[derive(Clone)]
-// pub struct wasmtime_component_resource_kind_guest_t {
-//     pub store: u64,
-//     pub instance: usize,
-//     pub id: u32,
-// }
-
-// #[repr(C)]
-// #[derive(Clone)]
-// pub struct wasmtime_component_resource_kind_uninstantiated_t {
-//     pub component: usize,
-//     pub index: u32,
-// }
-
-// #[repr(C, u8)]
-// #[derive(Clone)]
-// pub enum wasmtime_component_resource_type_t {
-//     Host(wasmtime_component_resource_kind_host_t),
-//     Guest(wasmtime_component_resource_kind_guest_t),
-//     Uninstantiated(wasmtime_component_resource_kind_uninstantiated_t),
-// }
-
 #[repr(C)]
 #[derive(Clone)]
 pub struct wasmtime_component_val_resource_t {
     pub data: Box<ResourceAny>,
-    // pub idx: u64,
-    // pub ty: wasmtime_component_resource_type_t,
-    // pub owned: bool,
 }
 
 #[repr(C)]
@@ -365,28 +333,6 @@ impl wasmtime_component_val_t {
                 Val::Flags(flags.as_slice().iter().map(|it| Ok(it.try_into()?)).collect::<Result<Vec<String>>>()?)
             }
             wasmtime_component_val_t::Resource(r) => {
-                // let res_any = ResourceAny {
-                //     idx: HostResourceIndex(r.idx),
-                //     ty: ResourceType {
-                //         kind: match r.ty {
-                //             wasmtime_component_resource_type_t::Host(host) => ResourceTypeKind::Host {
-                //                 id: TypeId::of::<CResourceType>(),
-                //                 user_id: host.user_id,
-                //             },
-                //             wasmtime_component_resource_type_t::Guest(guest) => ResourceTypeKind::Guest {
-                //                 id: DefinedResourceIndex(guest.id),
-                //                 instance: guest.instance,
-                //                 store: StoreId(guest.store.try_into().unwrap()),
-                //             },
-                //             wasmtime_component_resource_type_t::Uninstantiated(uninstantiated) => ResourceTypeKind::Uninstantiated {
-                //                 component: uninstantiated.component,
-                //                 index: ResourceIndex(uninstantiated.index),
-                //             },
-                //         },
-                //     },
-                //     owned: r.owned,
-                // };
-
                 Val::Resource(*r.data)
             }
         })
@@ -475,25 +421,6 @@ impl wasmtime_component_val_t {
                 wasmtime_component_val_t::Resource(wasmtime_component_val_resource_t {
                     data: Box::new(*r),
                 })
-                // wasmtime_component_val_t::Resource(wasmtime_component_val_resource_t {
-                //     idx: r.idx.as_u64(),
-                //     ty: match r.ty().kind {
-                //         // todo: id
-                //         ResourceTypeKind::Host { id: _, user_id } => wasmtime_component_resource_type_t::Host(wasmtime_component_resource_kind_host_t {
-                //             user_id: user_id,
-                //         }),
-                //         ResourceTypeKind::Guest { store, instance, id } => wasmtime_component_resource_type_t::Guest(wasmtime_component_resource_kind_guest_t {
-                //             store: store.as_raw().into(),
-                //             instance,
-                //             id: id.as_u32(),
-                //         }),
-                //         ResourceTypeKind::Uninstantiated { component, index } => wasmtime_component_resource_type_t::Uninstantiated(wasmtime_component_resource_kind_uninstantiated_t {
-                //             component,
-                //             index: index.as_u32(),
-                //         }),
-                //     },
-                //     owned: r.owned(),
-                // })
             }
         })
     }
