@@ -509,11 +509,11 @@ pub type wasmtime_component_func_callback_t = extern "C" fn(
     usize,
 ) -> Option<Box<wasm_trap_t>>;
 
-unsafe fn c_callback_to_rust_fn<T>(
+unsafe fn c_callback_to_rust_fn(
     callback: wasmtime_component_func_callback_t,
     data: *mut c_void,
     finalizer: Option<extern "C" fn(*mut std::ffi::c_void)>,
-) -> impl Fn(StoreContextMut<'_, T>, &[Val], &mut [Val]) -> Result<()> + Send + Sync + 'static {
+) -> impl Fn(StoreContextMut<'_, Host>, &[Val], &mut [Val]) -> Result<()> + Send + Sync + 'static {
     let foreign = crate::ForeignData { data, finalizer };
     move |_store, params, results| {
         let _ = &foreign; // move entire foreign into this closure
@@ -669,8 +669,7 @@ pub extern "C" fn wasmtime_component_resource_new(
     data: *mut c_void,
 ) -> Option<Box<wasmtime_error_t>> {
 
-    let host = store.data_mut();
-    let res = match host.table.push(CResourceType { data: ForeignDataNoFinalizer { data } }) {
+    let res = match store.data_mut().table.push(CResourceType { data: ForeignDataNoFinalizer { data } }) {
         Ok(r) => r,
         Err(e) => {
             return Some(Box::new(wasmtime_error_t::from(anyhow!("Resource error: {}", e))));
@@ -795,11 +794,37 @@ pub unsafe extern "C" fn wasmtime_component_resource_drop(
     val: &mut wasmtime_component_val_t,
 ) -> Option<Box<wasmtime_error_t>> {
     match val {
-        wasmtime_component_val_t::Resource(r) => match r.data.resource_drop(context) {
-            Ok(_) => None,
-            Err(e) => Some(Box::new(wasmtime_error_t::from(e))),
+        wasmtime_component_val_t::Resource(r) => {
+            match r.data.resource_drop(context) {
+                Ok(_) => None,
+                Err(e) => Some(Box::new(wasmtime_error_t::from(e))),
+            }
         },
         _ => None,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn wasmtime_component_resource_host_data(
+    mut store: WasmtimeStoreContextMutWasi<'_>,
+    val: &mut wasmtime_component_val_t,
+    data: &mut *mut c_void,
+) -> Option<Box<wasmtime_error_t>> {
+    match val {
+        wasmtime_component_val_t::Resource(r) => {
+            let rep = match r.data.rep(&mut store) {
+                Some(r) => r,
+                None => return Some(Box::new(wasmtime_error_t::from(anyhow!("Failed to get rep")))),
+            };
+            let d: &CResourceType = match store.data_mut().table.get_any_mut(rep) {
+                Ok(r) => r.downcast_mut().unwrap(),
+                Err(e) => return Some(Box::new(wasmtime_error_t::from(anyhow!("Failed to get from table: {}", e)))),
+            };
+
+            *data = d.data.data;
+            None
+        },
+        _ => Some(Box::new(wasmtime_error_t::from(anyhow!("Not a resource")))),
     }
 }
 

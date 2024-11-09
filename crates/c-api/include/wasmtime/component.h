@@ -260,6 +260,9 @@ wasmtime_component_val_delete(wasmtime_component_val_t *val);
 WASM_API_EXTERN wasmtime_error_t*
 wasmtime_component_resource_drop(wasmtime_component_context_t* context, wasmtime_component_val_t* val);
 
+WASM_API_EXTERN wasmtime_error_t*
+wasmtime_component_resource_host_data(wasmtime_component_context_t* context, wasmtime_component_val_t* val, void** data);
+
 WASM_API_EXTERN wasm_name_t
 wasmtime_component_resource_dump(wasmtime_component_val_t* val);
 

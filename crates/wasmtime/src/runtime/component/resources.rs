@@ -59,6 +59,14 @@ impl ResourceType {
         }
     }
 
+    /// todo
+    pub fn user_id(self) -> Option<usize> {
+        match self.kind {
+            ResourceTypeKind::Host { id: _, user_id } => Some(user_id),
+            _ => None
+        }
+    }
+
     /// Creates a new host resource type corresponding to `T`.
     ///
     /// Note that `T` is a mostly a phantom type parameter here. It does not
@@ -797,11 +805,12 @@ where
     pub fn try_from_resource_any(
         resource: ResourceAny,
         mut store: impl AsContextMut,
+        user_id: usize,
     ) -> Result<Self> {
         let store = store.as_context_mut();
         let mut tables = HostResourceTables::new_host(store.0);
         let ResourceAny { idx, ty, owned } = resource;
-        ensure!(ty == ResourceType::host::<T>(), "resource type mismatch");
+        ensure!(ty == ResourceType::host_user::<T>(user_id), "resource type mismatch");
         let (state, rep) = if owned {
             let rep = tables.host_resource_lift_own(idx)?;
             (AtomicResourceState::NOT_IN_TABLE, rep)
@@ -973,8 +982,8 @@ impl ResourceAny {
     }
 
     /// See [`Resource::try_from_resource_any`]
-    pub fn try_into_resource<T: 'static>(self, store: impl AsContextMut) -> Result<Resource<T>> {
-        Resource::try_from_resource_any(self, store)
+    pub fn try_into_resource<T: 'static>(self, store: impl AsContextMut, user_id: usize) -> Result<Resource<T>> {
+        Resource::try_from_resource_any(self, store, user_id)
     }
 
     /// Returns the host resource index
@@ -1122,6 +1131,17 @@ impl ResourceAny {
             }
             _ => bad_type_info(),
         }
+    }
+
+    /// Attempts to return the rep for the ResourceAny without converting to Resource
+    pub fn rep(
+        self,
+        mut store: impl AsContextMut
+    ) -> Option<u32> {
+        let store = store.as_context_mut();
+        let mut tables = HostResourceTables::new_host(store.0);
+        let (idx, _) = tables.validate_host_index(self.idx, false).ok()?;
+        tables.tables.resource_rep(None, idx).ok()
     }
 }
 
