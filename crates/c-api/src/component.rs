@@ -502,6 +502,7 @@ pub extern "C" fn wasmtime_component_linker_link_wasi(
 }
 
 pub type wasmtime_component_func_callback_t = extern "C" fn(
+    WasmtimeStoreContextMutWasi<'_>,
     *mut c_void,
     *const wasmtime_component_val_t,
     usize,
@@ -515,7 +516,7 @@ unsafe fn c_callback_to_rust_fn(
     finalizer: Option<extern "C" fn(*mut std::ffi::c_void)>,
 ) -> impl Fn(StoreContextMut<'_, Host>, &[Val], &mut [Val]) -> Result<()> + Send + Sync + 'static {
     let foreign = crate::ForeignData { data, finalizer };
-    move |_store, params, results| {
+    move |mut store, params, results| {
         let _ = &foreign; // move entire foreign into this closure
 
         // Convert `params/results` to `wasmtime_component_val_t`. Use the previous
@@ -539,6 +540,7 @@ unsafe fn c_callback_to_rust_fn(
         // Invoke the C function pointer, getting the results.
 
         let out = callback(
+            store.as_context_mut(),
             foreign.data,
             params.as_ptr(),
             params.len(),

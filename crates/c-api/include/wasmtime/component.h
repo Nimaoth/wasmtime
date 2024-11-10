@@ -201,6 +201,7 @@ wasmtime_component_linker_link_wasi(wasmtime_component_linker_t *linker,
                                     wasm_trap_t **trap_out);
 
 typedef wasm_trap_t *(*wasmtime_component_func_callback_t)(
+    wasmtime_component_context_t* ctx,
     void *env, const wasmtime_component_val_t *args,
     size_t nargs, wasmtime_component_val_t *results, size_t nresults);
 
