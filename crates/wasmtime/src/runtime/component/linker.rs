@@ -3,8 +3,9 @@ use crate::component::instance::RuntimeImport;
 use crate::component::matching::{InstanceType, TypeChecker};
 use crate::component::types;
 use crate::component::{
-    Component, ComponentNamedList, Instance, InstancePre, Lift, Lower, ResourceType, Val,
+    Component, ComponentNamedList, Instance, InstancePre, Lift, Lower, ResourceType, Val, ComponentExportIndex,
 };
+use crate::runtime::store::StoreInner;
 use crate::hash_map::HashMap;
 use crate::prelude::*;
 use crate::{AsContextMut, Engine, Module, StoreContextMut};
@@ -97,6 +98,7 @@ pub struct LinkerInstance<'a, T> {
     map: &'a mut NameMap<usize, Definition>,
     allow_shadowing: bool,
     _marker: marker::PhantomData<fn() -> T>,
+    debug_name: String,
 }
 
 #[derive(Clone)]
@@ -146,6 +148,7 @@ impl<T> Linker<T> {
             map: &mut self.map,
             allow_shadowing: self.allow_shadowing,
             _marker: self._marker,
+            debug_name: "root".to_owned(),
         }
     }
 
@@ -379,6 +382,7 @@ impl<T> LinkerInstance<'_, T> {
             map: self.map,
             allow_shadowing: self.allow_shadowing,
             _marker: self._marker,
+            debug_name: self.debug_name.clone(),
         }
     }
 
@@ -407,6 +411,62 @@ impl<T> LinkerInstance<'_, T> {
         Return: ComponentNamedList + Lower + 'static,
     {
         self.insert(name, Definition::Func(HostFunc::from_closure(func)))?;
+        Ok(())
+    }
+
+    fn define_instance_impl<'a, K, I>(&mut self, store: &'_ mut StoreInner<K>, component: &Component, instance: &Instance, exports: I, parent_instance_index: Option<&ComponentExportIndex>) -> Result<()>
+        where I: ExactSizeIterator<Item = (&'a str, types::ComponentItem)> + 'a,
+    {
+        for (export_name, export) in exports {
+            println!("Component export in {}: {} -> {:?}", self.debug_name, export_name, export);
+            match export {
+                types::ComponentItem::ComponentFunc(_) | types::ComponentItem::CoreFunc(_) => {
+
+                    let (_, func_index) = component.export_index(parent_instance_index, export_name)
+                        .ok_or(anyhow!("Failed to find func index {}.", export_name))?;
+
+                    let func_name = export_name;
+                    let func = instance.get_func(&mut *store, &func_index)
+                        .ok_or(anyhow!("Failed to find func {} in instance", &func_name))?;
+                    let fname = func_name.to_owned();
+                    println!("define {} in {}", func_name, self.debug_name);
+                    self.func_new(&func_name, move |store, params, results| {
+                        println!("sandwitch {}, {:?}", fname, params);
+                        func.call(store, params, results)?;
+                        println!("sandwitch done {}, {:?}", fname, results);
+                        Ok(())
+                    })?;
+                    println!("defined {}", func_name);
+
+                },
+                types::ComponentItem::ComponentInstance(i) => {
+                    let (_, instance_index) = component.export_index(parent_instance_index, export_name)
+                        .ok_or(anyhow!("Failed to find instance index {}.", export_name))?;
+                    println!("Define sub instance {}, {:?}", export_name, instance_index);
+                    let engine = self.engine;
+                    self.instance(export_name)? .define_instance_impl(
+                        &mut *store,
+                        component,
+                        instance,
+                        i.exports(engine),
+                        Some(&instance_index))?;
+                    continue;
+                }
+                _ => {
+                    println!("  not a function");
+                    continue;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// TODO: needs more words and examples
+    pub fn define_instance<K>(&mut self, store: &'_ mut StoreInner<K>, component: &Component, instance: &Instance) -> Result<()>
+    {
+        self.define_instance_impl(
+            store, component, instance, component.component_type().exports(self.engine), None)?;
         Ok(())
     }
 
@@ -682,6 +742,7 @@ impl<T> LinkerInstance<'_, T> {
     /// Same as [`LinkerInstance::instance`] except with different lifetime
     /// parameters.
     pub fn into_instance(mut self, name: &str) -> Result<Self> {
+        self.debug_name = format!("{}/{}", self.debug_name, name);
         let name = self.insert(name, Definition::Instance(NameMap::default()))?;
         self.map = match self.map.raw_get_mut(&name) {
             Some(Definition::Instance(map)) => map,

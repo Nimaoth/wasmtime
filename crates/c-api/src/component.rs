@@ -696,6 +696,19 @@ pub extern "C" fn wasmtime_component_resource_new(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn wasmtime_component_linker_define_instance(
+    linker: &mut wasmtime_component_linker_t,
+    mut store: WasmtimeStoreContextMutWasi<'_>,
+    component: &wasmtime_component_t,
+    instance: &wasmtime_component_instance_t,
+) -> Option<Box<wasmtime_error_t>> {
+    match linker.linker.root().define_instance(store.as_context_mut().0, &component.component, &instance.instance) {
+        Ok(_) => None,
+        Err(e) => Some(Box::new(e.into())),
+    }
+}
+
+#[no_mangle]
 pub extern "C" fn wasmtime_component_linker_instantiate(
     linker: &wasmtime_component_linker_t,
     store: WasmtimeStoreContextMutWasi<'_>,

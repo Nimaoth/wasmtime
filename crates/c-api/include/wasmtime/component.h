@@ -233,6 +233,12 @@ wasmtime_component_resource_new(wasmtime_component_context_t* context,
 typedef struct wasmtime_component_instance_t wasmtime_component_instance_t;
 
 WASM_API_EXTERN wasmtime_error_t *
+wasmtime_component_linker_define_instance(
+    const wasmtime_component_linker_t *linker, wasmtime_component_context_t *context,
+    const wasmtime_component_t *component, wasmtime_component_instance_t *instance);
+
+
+WASM_API_EXTERN wasmtime_error_t *
 wasmtime_component_linker_instantiate(
     const wasmtime_component_linker_t *linker, wasmtime_component_context_t *context,
     const wasmtime_component_t *component,
