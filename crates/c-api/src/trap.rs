@@ -121,7 +121,7 @@ pub extern "C" fn wasmtime_trap_code(raw: &wasm_trap_t, code: &mut u8) -> bool {
         Some(trap) => trap,
         None => return false,
     };
-    *code = match trap {
+    *code = match *trap {
         Trap::StackOverflow => 0,
         Trap::MemoryOutOfBounds => 1,
         Trap::HeapMisaligned => 2,
@@ -133,9 +133,17 @@ pub extern "C" fn wasmtime_trap_code(raw: &wasm_trap_t, code: &mut u8) -> bool {
         Trap::BadConversionToInteger => 8,
         Trap::UnreachableCodeReached => 9,
         Trap::Interrupt => 10,
+        Trap::AlwaysTrapAdapter => 10,
         Trap::OutOfFuel => 11,
-        Trap::AlwaysTrapAdapter => unreachable!("component model not supported"),
-        _ => unreachable!(),
+        Trap::AtomicWaitNonSharedMemory => 12,
+        Trap::NullReference => 13,
+        Trap::ArrayOutOfBounds => 14,
+        Trap::AllocationTooLarge => 15,
+        Trap::CannotEnterComponent => 16,
+        _ => {
+            println!("wasmtime_trap_code Unknown trap {:?}", trap);
+            return false;
+        }
     };
     true
 }

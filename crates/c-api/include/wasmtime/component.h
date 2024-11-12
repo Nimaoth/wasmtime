@@ -249,7 +249,7 @@ typedef struct wasmtime_component_func_t wasmtime_component_func_t;
 WASM_API_EXTERN bool
 wasmtime_component_instance_get_func(
     const wasmtime_component_instance_t *instance, wasmtime_component_context_t *context,
-    uint8_t *name, size_t name_len, wasmtime_component_func_t **item_out);
+    const char *name, size_t name_len, wasmtime_component_func_t **item_out);
 
 WASM_API_EXTERN wasmtime_error_t *
 wasmtime_component_func_call(

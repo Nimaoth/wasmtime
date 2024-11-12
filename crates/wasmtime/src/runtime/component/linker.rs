@@ -418,7 +418,6 @@ impl<T> LinkerInstance<'_, T> {
         where I: ExactSizeIterator<Item = (&'a str, types::ComponentItem)> + 'a,
     {
         for (export_name, export) in exports {
-            println!("Component export in {}: {} -> {:?}", self.debug_name, export_name, export);
             match export {
                 types::ComponentItem::ComponentFunc(_) | types::ComponentItem::CoreFunc(_) => {
 
@@ -429,20 +428,16 @@ impl<T> LinkerInstance<'_, T> {
                     let func = instance.get_func(&mut *store, &func_index)
                         .ok_or(anyhow!("Failed to find func {} in instance", &func_name))?;
                     let fname = func_name.to_owned();
-                    println!("define {} in {}", func_name, self.debug_name);
-                    self.func_new(&func_name, move |store, params, results| {
-                        println!("sandwitch {}, {:?}", fname, params);
-                        func.call(store, params, results)?;
-                        println!("sandwitch done {}, {:?}", fname, results);
+                    self.func_new(&func_name, move |mut store, params, results| {
+                        func.call(&mut store, params, results)?;
+                        func.post_return(store)?;
                         Ok(())
                     })?;
-                    println!("defined {}", func_name);
 
                 },
                 types::ComponentItem::ComponentInstance(i) => {
                     let (_, instance_index) = component.export_index(parent_instance_index, export_name)
                         .ok_or(anyhow!("Failed to find instance index {}.", export_name))?;
-                    println!("Define sub instance {}, {:?}", export_name, instance_index);
                     let engine = self.engine;
                     self.instance(export_name)? .define_instance_impl(
                         &mut *store,
@@ -453,7 +448,6 @@ impl<T> LinkerInstance<'_, T> {
                     continue;
                 }
                 _ => {
-                    println!("  not a function");
                     continue;
                 }
             }
