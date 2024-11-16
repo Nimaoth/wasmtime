@@ -773,6 +773,21 @@ pub struct ComponentExportIndex {
     pub(crate) index: ExportIndex,
 }
 
+impl ComponentExportIndex {
+    /// Convert export index into it's raw components
+    pub fn raw(&self) -> (u64, u32) {
+        (self.id.0.get(), self.index.as_u32())
+    }
+
+    /// Create export index from it's raw components
+    pub fn from_raw(id: u64, index: u32) -> Result<ComponentExportIndex> {
+        Ok(ComponentExportIndex {
+            id: CompiledModuleId(id.try_into()?),
+            index: ExportIndex::from_u32(index),
+        })
+    }
+}
+
 impl InstanceExportLookup for ComponentExportIndex {
     fn lookup(&self, component: &Component) -> Option<ExportIndex> {
         if component.inner.id == self.id {

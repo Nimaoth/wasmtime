@@ -15,6 +15,7 @@ use core::marker;
 use core::pin::Pin;
 use wasmtime_environ::component::{NameMap, NameMapIntern};
 use wasmtime_environ::PrimaryMap;
+use wasmtime_environ::component::TypeDef;
 
 /// A type used to instantiate [`Component`]s.
 ///
@@ -427,7 +428,6 @@ impl<T> LinkerInstance<'_, T> {
                     let func_name = export_name;
                     let func = instance.get_func(&mut *store, &func_index)
                         .ok_or(anyhow!("Failed to find func {} in instance", &func_name))?;
-                    let fname = func_name.to_owned();
                     self.func_new(&func_name, move |mut store, params, results| {
                         func.call(&mut store, params, results)?;
                         func.post_return(store)?;
@@ -775,4 +775,43 @@ impl NameMapIntern for Strings {
     fn lookup(&self, string: &str) -> Option<usize> {
         self.string2idx.get(string).cloned()
     }
+}
+
+fn iter_imports_rec<'a, I, F>(component: &Component, imports: I, path: String, cb: F) -> Result<()>
+    where I: ExactSizeIterator<Item = (&'a String, &'a TypeDef)> + 'a,
+        F: Fn(&str, &str, &TypeDef) + Copy
+{
+    for (import_name, import) in imports {
+        match import {
+            TypeDef::ComponentInstance(type_index) => {
+                let instance_typ = &component.types()[*type_index];
+                let sub_path = if path.len() == 0 {
+                    import_name.to_owned()
+                } else {
+                    format!("{}/{}", path, import_name)
+                };
+
+                iter_imports_rec(
+                    component,
+                    instance_typ.exports.iter(), sub_path, cb)?;
+                continue;
+            }
+
+            _ => {
+                cb(&path, import_name, import);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Iterates over every import of the given component, recursing into component instances,
+/// and calls `cb` for every import.
+pub fn iter_imports<F>(component: &Component, cb: F) -> Result<()>
+    where F: Fn(&str, &str, &TypeDef) + Copy
+{
+    let env_component = component.env_component();
+    iter_imports_rec(component, env_component.import_types.iter().map(|(_, (n, t))| (n, t)), "".to_owned(), cb)?;
+    Ok(())
 }

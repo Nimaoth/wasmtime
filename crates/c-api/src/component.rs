@@ -1,10 +1,12 @@
 use crate::ForeignData;
 use std::ffi::c_void;
 use anyhow::{Result, anyhow};
-use wasmtime::component::{Component, Func, Instance, Linker, Val, ResourceType, Resource, ResourceAny};
+use wasmtime::component::{Component, Func, Instance, Linker, Val, ResourceType, Resource, ResourceAny, ComponentExportIndex, iter_imports};
+use wasmtime::component::types::{ComponentItem};
 use wasmtime::{AsContextMut, StoreContextMut, Store, StoreLimits,
     StoreLimitsBuilder};
 use wasmtime_wasi::{WasiView, WasiCtx};
+use wasmtime_environ::component::TypeDef;
 
 use crate::{
     declare_vecs, handle_call_error, handle_result, wasm_byte_vec_t, wasm_config_t, wasm_engine_t,
@@ -136,6 +138,13 @@ pub extern "C" fn wasmtime_component_store_limiter(
 pub struct wasmtime_component_val_record_field_t {
     pub name: wasm_name_t,
     pub val: wasmtime_component_val_t,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct wasmtime_component_export_index_t {
+    id: u64,
+    index: u32,
 }
 
 impl Default for wasmtime_component_val_record_field_t {
@@ -732,6 +741,108 @@ pub struct wasmtime_component_instance_t {
     instance: Instance,
 }
 
+impl wasmtime_component_export_index_t {
+    fn to_export_index(self) -> Result<ComponentExportIndex> {
+        ComponentExportIndex::from_raw(self.id, self.index)
+    }
+}
+
+
+#[repr(u8)]
+#[derive(Clone)]
+pub enum wasmtime_component_item_type_t {
+    Component,
+    ComponentInstance,
+    ComponentFunc,
+    Interface,
+    Module,
+    CoreFunc,
+    Resource,
+}
+
+
+pub type wasmtime_component_imports_callback_t = extern "C" fn(
+    *mut c_void, // user data
+    *const u8, // path
+    usize, // path len
+    *const u8, // name
+    usize, // name len
+    wasmtime_component_item_type_t
+);
+
+#[no_mangle]
+pub unsafe extern "C" fn wasmtime_component_iterate_imports(
+    component: &wasmtime_component_t,
+    cb: wasmtime_component_imports_callback_t,
+    data: *mut c_void,
+) {
+
+    _ = iter_imports(&component.component, move |path, name, typ| {
+        let tag = match typ {
+            TypeDef::Component(_) => wasmtime_component_item_type_t::Component,
+            TypeDef::ComponentInstance(_) => wasmtime_component_item_type_t::ComponentInstance,
+            TypeDef::ComponentFunc(_) => wasmtime_component_item_type_t::ComponentFunc,
+            TypeDef::Interface(_) => wasmtime_component_item_type_t::Interface,
+            TypeDef::Module(_) => wasmtime_component_item_type_t::Module,
+            TypeDef::CoreFunc(_) => wasmtime_component_item_type_t::CoreFunc,
+            TypeDef::Resource(_) => wasmtime_component_item_type_t::Resource,
+        };
+        cb(data, path.as_ptr(), path.len(), name.as_ptr(), name.len(), tag);
+    });
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn wasmtime_component_get_export(
+    component: &wasmtime_component_t,
+    name: *const u8,
+    len: usize,
+    parent_index: Option<&wasmtime_component_export_index_t>,
+    out_index: &mut wasmtime_component_export_index_t,
+) -> bool {
+    let name = crate::slice_from_raw_parts(name, len);
+    let name = match std::str::from_utf8(name) {
+        Ok(name) => name,
+        Err(_) => return false,
+    };
+
+    let parent_index = parent_index.map(|x| x.to_export_index().ok()).flatten();
+    let parent_index = match &parent_index {
+        Some(p) => Some(p),
+        None => None,
+    };
+
+    match component.component.export_index(parent_index, name) {
+        Some((_, index)) => {
+            let (id, index) = index.raw();
+            *out_index = wasmtime_component_export_index_t {
+                id: id,
+                index: index,
+            };
+            true
+        }
+        None => false
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn wasmtime_component_instance_get_func_by_index(
+    instance: &wasmtime_component_instance_t,
+    context: WasmtimeStoreContextMutWasi<'_>,
+    index: wasmtime_component_export_index_t,
+    item: &mut *mut wasmtime_component_func_t,
+) -> bool {
+    let index = match index.to_export_index() {
+        Ok(index) => index,
+        Err(_) => return false,
+    };
+
+    let func = instance.instance.get_func(context, index);
+    if let Some(func) = func {
+        *item = Box::into_raw(Box::new(wasmtime_component_func_t { func }));
+    }
+    func.is_some()
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn wasmtime_component_instance_get_func(
     instance: &wasmtime_component_instance_t,
@@ -745,6 +856,7 @@ pub unsafe extern "C" fn wasmtime_component_instance_get_func(
         Ok(name) => name,
         Err(_) => return false,
     };
+
     let func = instance.instance.get_func(context, name);
     if let Some(func) = func {
         *item = Box::into_raw(Box::new(wasmtime_component_func_t { func }));

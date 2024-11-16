@@ -5,7 +5,7 @@ use core::num::NonZeroU64;
 /// A unique identifier (within an engine or similar) for a compiled
 /// module.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct CompiledModuleId(NonZeroU64);
+pub struct CompiledModuleId(pub(crate) NonZeroU64);
 
 impl CompiledModuleId {
     /// Allocates a new ID which will be unique within this process.

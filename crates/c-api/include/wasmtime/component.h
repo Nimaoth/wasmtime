@@ -169,6 +169,11 @@ typedef struct wasmtime_component_val_record_field_t {
   wasmtime_component_val_t val;
 } wasmtime_component_val_record_field_t;
 
+typedef struct wasmtime_component_export_index_t {
+  uint64_t id;
+  uint32_t index;
+} wasmtime_component_export_index_t;
+
 // Set a value within this bitset.
 //
 // If this bit set is too small to hold a value at `index` it will be resized.
@@ -215,6 +220,30 @@ wasmtime_component_linker_func_new(wasmtime_component_linker_t *linker,
                                     void* data,
                                     void (*finalizer)(void *));
 
+typedef uint8_t wasmtime_component_item_type_t;
+
+enum wasmtime_component_item_type {
+    WASMTIME_COMPONENT_ITEM_TYPE_COMPONENT,
+    WASMTIME_COMPONENT_ITEM_TYPE_COMPONENT_INSTANCE,
+    WASMTIME_COMPONENT_ITEM_TYPE_COMPONENT_FUNC,
+    WASMTIME_COMPONENT_ITEM_TYPE_INTERFACE,
+    WASMTIME_COMPONENT_ITEM_TYPE_MODULE,
+    WASMTIME_COMPONENT_ITEM_TYPE_CORE_FUNC,
+    WASMTIME_COMPONENT_ITEM_TYPE_RESOURCE,
+};
+
+typedef void (*wasmtime_component_imports_callback_t)(
+    void* data,
+    const char* path,
+    size_t path_len,
+    const char* name,
+    size_t name_len,
+    wasmtime_component_item_type_t typ
+    );
+
+WASM_API_EXTERN void
+wasmtime_component_iterate_imports(wasmtime_component_t* component, wasmtime_component_imports_callback_t cb, void* data);
+
 WASM_API_EXTERN wasmtime_error_t *
 wasmtime_component_linker_define_resource(wasmtime_component_linker_t *linker,
                                     const char* env_name,
@@ -245,6 +274,16 @@ wasmtime_component_linker_instantiate(
     wasmtime_component_instance_t **instance_out, wasm_trap_t **trap_out);
 
 typedef struct wasmtime_component_func_t wasmtime_component_func_t;
+
+WASM_API_EXTERN bool
+wasmtime_component_get_export(
+    const wasmtime_component_t *component, const char *name, size_t name_len,
+    wasmtime_component_export_index_t* parent_index, wasmtime_component_export_index_t* index_out);
+
+WASM_API_EXTERN bool
+wasmtime_component_instance_get_func_by_index(
+    const wasmtime_component_instance_t *instance, wasmtime_component_context_t *context,
+    wasmtime_component_export_index_t index, wasmtime_component_func_t **item_out);
 
 WASM_API_EXTERN bool
 wasmtime_component_instance_get_func(
