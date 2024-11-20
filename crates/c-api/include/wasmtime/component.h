@@ -1,0 +1,319 @@
+
+/**
+ * The component model
+ *
+ * TODO: Write some more documentation here like in the Rust API.
+ *
+ */
+
+#ifndef WASMTIME_COMPONENT_H
+#define WASMTIME_COMPONENT_H
+
+#include <wasm.h>
+#include <wasmtime/config.h>
+#include <wasmtime/error.h>
+#include <wasmtime/store.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * \brief Whether or not to enable support for the component model in
+ * Wasmtime.
+ *
+ * For more information see the Rust documentation at
+ * https://docs.wasmtime.dev/api/wasmtime/struct.Config.html#method.wasm_component_model
+ */
+WASMTIME_CONFIG_PROP(void, component_model, bool)
+
+typedef struct wasmtime_component_store wasmtime_component_store_t;
+typedef struct wasmtime_component_context wasmtime_component_context_t;
+
+// The tag part of wasmtime_component_val_t that specifies what variant is
+// populated in wasmtime_component_val_payload_t.
+typedef uint8_t wasmtime_component_val_kind_t;
+
+enum wasmtime_component_val_kind_enum {
+  WASMTIME_COMPONENT_VAL_KIND_BOOL = 0,
+  WASMTIME_COMPONENT_VAL_KIND_S8 = 1,
+  WASMTIME_COMPONENT_VAL_KIND_U8 = 2,
+  WASMTIME_COMPONENT_VAL_KIND_S16 = 3,
+  WASMTIME_COMPONENT_VAL_KIND_U16 = 4,
+  WASMTIME_COMPONENT_VAL_KIND_S32 = 5,
+  WASMTIME_COMPONENT_VAL_KIND_U32 = 6,
+  WASMTIME_COMPONENT_VAL_KIND_S64 = 7,
+  WASMTIME_COMPONENT_VAL_KIND_U64 = 8,
+  WASMTIME_COMPONENT_VAL_KIND_FLOAT_32 = 9,
+  WASMTIME_COMPONENT_VAL_KIND_FLOAT_64 = 10,
+  WASMTIME_COMPONENT_VAL_KIND_CHAR = 11,
+  WASMTIME_COMPONENT_VAL_KIND_STRING = 12,
+  WASMTIME_COMPONENT_VAL_KIND_LIST = 13,
+  WASMTIME_COMPONENT_VAL_KIND_RECORD = 14,
+  WASMTIME_COMPONENT_VAL_KIND_TUPLE = 15,
+  WASMTIME_COMPONENT_VAL_KIND_VARIANT = 16,
+  WASMTIME_COMPONENT_VAL_KIND_ENUM = 17,
+  WASMTIME_COMPONENT_VAL_KIND_OPTION = 18,
+  WASMTIME_COMPONENT_VAL_KIND_RESULT = 19,
+  WASMTIME_COMPONENT_VAL_KIND_FLAGS = 20,
+  WASMTIME_COMPONENT_VAL_KIND_RESOURCE = 21,
+};
+
+typedef struct wasmtime_component_val_t wasmtime_component_val_t;
+typedef struct wasmtime_component_val_record_field_t
+    wasmtime_component_val_record_field_t;
+
+WASM_API_EXTERN wasmtime_component_store_t *
+wasmtime_component_store_new(wasm_engine_t *engine,
+                             void *data,
+                             void (*finalizer)(void *));
+
+WASM_API_EXTERN wasmtime_component_context_t*
+wasmtime_component_store_context(wasmtime_component_store_t *store);
+
+WASM_API_EXTERN void
+wasmtime_component_store_delete(wasmtime_component_store_t *store);
+
+WASM_API_EXTERN void
+wasmtime_component_store_limiter(wasmtime_component_store_t *store,
+                                 int64_t memory_size,
+                                 int64_t table_elements,
+                                 int64_t instances, int64_t tables,
+                                 int64_t memories);
+
+#define WASMTIME_COMPONENT_DECLARE_VEC(name, element)                          \
+  typedef struct wasmtime_component_##name##_vec_t {                           \
+    size_t size;                                                               \
+    element *data;                                                             \
+  } wasmtime_component_##name##_vec_t;                                         \
+                                                                               \
+  WASM_API_EXTERN void wasmtime_component_##name##_vec_new_empty(              \
+      wasmtime_component_##name##_vec_t *out);                                 \
+  WASM_API_EXTERN void wasmtime_component_##name##_vec_new_uninitialized(      \
+      wasmtime_component_##name##_vec_t *out, size_t);                         \
+  WASM_API_EXTERN void wasmtime_component_##name##_vec_new(                    \
+      wasmtime_component_##name##_vec_t *out, size_t, const element*);         \
+  WASM_API_EXTERN void wasmtime_component_##name##_vec_copy(                   \
+      wasmtime_component_##name##_vec_t *out,                                  \
+      const wasmtime_component_##name##_vec_t *);                              \
+  WASM_API_EXTERN void wasmtime_component_##name##_vec_delete(                 \
+      wasmtime_component_##name##_vec_t *);
+
+// A vector of values.
+WASMTIME_COMPONENT_DECLARE_VEC(val, wasmtime_component_val_t);
+
+// A tuple of named fields.
+WASMTIME_COMPONENT_DECLARE_VEC(val_record_field, wasmtime_component_val_record_field_t);
+
+// A variable sized bitset.
+WASMTIME_COMPONENT_DECLARE_VEC(val_flags, wasm_name_t);
+
+#undef WASMTIME_COMPONENT_DECLARE_VEC
+
+// A variant contains the discriminant index and an optional value that is held.
+typedef struct wasmtime_component_val_variant_t {
+  wasm_name_t name;
+  wasmtime_component_val_t *val;
+} wasmtime_component_val_variant_t;
+
+// A result is an either type holding a value and a bit if is it an ok or error
+// variant.
+typedef struct wasmtime_component_val_result_t {
+  wasmtime_component_val_t *val;
+  bool error;
+} wasmtime_component_val_result_t;
+
+// Which value within an enumeration is selected.
+typedef struct wasmtime_component_val_enum_t {
+  wasm_name_t name;
+} wasmtime_component_val_enum_t;
+
+typedef struct wasmtime_component_val_resource_t {
+  void* data;
+} wasmtime_component_val_resource_t;
+
+typedef union wasmtime_component_val_payload_t {
+  bool boolean;
+  int8_t s8;
+  uint8_t u8;
+  int16_t s16;
+  uint16_t u16;
+  int32_t s32;
+  uint32_t u32;
+  int64_t s64;
+  uint64_t u64;
+  float f32;
+  double f64;
+  uint32_t character;
+  wasm_name_t string;
+  wasmtime_component_val_vec_t list;
+  wasmtime_component_val_record_field_vec_t record;
+  wasmtime_component_val_vec_t tuple;
+  wasmtime_component_val_variant_t variant;
+  wasmtime_component_val_enum_t enumeration;
+  wasmtime_component_val_t *option;
+  wasmtime_component_val_result_t result;
+  wasmtime_component_val_flags_vec_t flags;
+  wasmtime_component_val_resource_t resource;
+} wasmtime_component_val_payload_t;
+
+// The tagged union for a value within the component model.
+typedef struct wasmtime_component_val_t {
+  wasmtime_component_val_kind_t kind;
+  wasmtime_component_val_payload_t payload;
+} wasmtime_component_val_t;
+
+// A record is a series of named fields, which are values with a string name.
+typedef struct wasmtime_component_val_record_field_t {
+  wasm_name_t name;
+  wasmtime_component_val_t val;
+} wasmtime_component_val_record_field_t;
+
+typedef struct wasmtime_component_export_index_t {
+  uint64_t id;
+  uint32_t index;
+} wasmtime_component_export_index_t;
+
+// Set a value within this bitset.
+//
+// If this bit set is too small to hold a value at `index` it will be resized.
+WASM_API_EXTERN void
+wasmtime_component_val_flags_set(wasmtime_component_val_flags_vec_t *flags,
+                                 uint32_t index, bool enabled);
+
+// Test if this bitset holds a value at `index`.
+WASM_API_EXTERN bool
+wasmtime_component_val_flags_test(
+    const wasmtime_component_val_flags_vec_t *flags, uint32_t index);
+
+typedef struct wasmtime_component_t wasmtime_component_t;
+
+WASM_API_EXTERN wasmtime_error_t *
+wasmtime_component_from_binary(const wasm_engine_t *engine, const uint8_t *buf,
+                               size_t len,
+                               wasmtime_component_t **component_out);
+
+WASM_API_EXTERN void
+wasmtime_component_delete(wasmtime_component_t *);
+
+typedef struct wasmtime_component_linker_t wasmtime_component_linker_t;
+
+WASM_API_EXTERN wasmtime_component_linker_t *
+wasmtime_component_linker_new(const wasm_engine_t *engine);
+
+WASM_API_EXTERN wasmtime_error_t *
+wasmtime_component_linker_link_wasi(wasmtime_component_linker_t *linker,
+                                    wasm_trap_t **trap_out);
+
+typedef wasm_trap_t *(*wasmtime_component_func_callback_t)(
+    wasmtime_component_context_t* ctx,
+    void *env, const wasmtime_component_val_t *args,
+    size_t nargs, wasmtime_component_val_t *results, size_t nresults);
+
+WASM_API_EXTERN wasmtime_error_t *
+wasmtime_component_linker_func_new(wasmtime_component_linker_t *linker,
+                                    const char* env_name,
+                                    size_t env_name_len,
+                                    const char* name,
+                                    size_t len,
+                                    wasmtime_component_func_callback_t callback,
+                                    void* data,
+                                    void (*finalizer)(void *));
+
+typedef uint8_t wasmtime_component_item_type_t;
+
+enum wasmtime_component_item_type {
+    WASMTIME_COMPONENT_ITEM_TYPE_COMPONENT,
+    WASMTIME_COMPONENT_ITEM_TYPE_COMPONENT_INSTANCE,
+    WASMTIME_COMPONENT_ITEM_TYPE_COMPONENT_FUNC,
+    WASMTIME_COMPONENT_ITEM_TYPE_INTERFACE,
+    WASMTIME_COMPONENT_ITEM_TYPE_MODULE,
+    WASMTIME_COMPONENT_ITEM_TYPE_CORE_FUNC,
+    WASMTIME_COMPONENT_ITEM_TYPE_RESOURCE,
+};
+
+typedef void (*wasmtime_component_imports_callback_t)(
+    void* data,
+    const char* path,
+    size_t path_len,
+    const char* name,
+    size_t name_len,
+    wasmtime_component_item_type_t typ
+    );
+
+WASM_API_EXTERN void
+wasmtime_component_iterate_imports(wasmtime_component_t* component, wasmtime_component_imports_callback_t cb, void* data);
+
+WASM_API_EXTERN wasmtime_error_t *
+wasmtime_component_linker_define_resource(wasmtime_component_linker_t *linker,
+                                    const char* env_name,
+                                    size_t env_name_len,
+                                    const char* name,
+                                    size_t len,
+                                    size_t user_id,
+                                    void (*finalizer)(void *));
+
+WASM_API_EXTERN wasmtime_error_t *
+wasmtime_component_resource_new(wasmtime_component_context_t* context,
+                                size_t user_id,
+                                wasmtime_component_val_t* resource,
+                                void* data);
+
+typedef struct wasmtime_component_instance_t wasmtime_component_instance_t;
+
+WASM_API_EXTERN wasmtime_error_t *
+wasmtime_component_linker_define_instance(
+    const wasmtime_component_linker_t *linker, wasmtime_component_context_t *context,
+    const wasmtime_component_t *component, wasmtime_component_instance_t *instance);
+
+
+WASM_API_EXTERN wasmtime_error_t *
+wasmtime_component_linker_instantiate(
+    const wasmtime_component_linker_t *linker, wasmtime_component_context_t *context,
+    const wasmtime_component_t *component,
+    wasmtime_component_instance_t **instance_out, wasm_trap_t **trap_out);
+
+typedef struct wasmtime_component_func_t wasmtime_component_func_t;
+
+WASM_API_EXTERN bool
+wasmtime_component_get_export(
+    const wasmtime_component_t *component, const char *name, size_t name_len,
+    wasmtime_component_export_index_t* parent_index, wasmtime_component_export_index_t* index_out);
+
+WASM_API_EXTERN bool
+wasmtime_component_instance_get_func_by_index(
+    const wasmtime_component_instance_t *instance, wasmtime_component_context_t *context,
+    wasmtime_component_export_index_t index, wasmtime_component_func_t **item_out);
+
+WASM_API_EXTERN bool
+wasmtime_component_instance_get_func(
+    const wasmtime_component_instance_t *instance, wasmtime_component_context_t *context,
+    const char *name, size_t name_len, wasmtime_component_func_t **item_out);
+
+WASM_API_EXTERN wasmtime_error_t *
+wasmtime_component_func_call(
+    const wasmtime_component_func_t *func, wasmtime_component_context_t *context,
+    const wasmtime_component_val_t *params, size_t params_len,
+    wasmtime_component_val_t *results, size_t results_len,
+    wasm_trap_t **trap_out);
+
+WASM_API_EXTERN wasmtime_component_val_t *
+wasmtime_component_val_new();
+
+WASM_API_EXTERN void
+wasmtime_component_val_delete(wasmtime_component_val_t *val);
+
+WASM_API_EXTERN wasmtime_error_t*
+wasmtime_component_resource_drop(wasmtime_component_context_t* context, wasmtime_component_val_t* val);
+
+WASM_API_EXTERN wasmtime_error_t*
+wasmtime_component_resource_host_data(wasmtime_component_context_t* context, wasmtime_component_val_t* val, void** data);
+
+WASM_API_EXTERN wasm_name_t
+wasmtime_component_resource_dump(wasmtime_component_val_t* val);
+
+#ifdef __cplusplus
+} // extern "C"
+#endif
+
+#endif // WASMTIME_COMPONENT_H

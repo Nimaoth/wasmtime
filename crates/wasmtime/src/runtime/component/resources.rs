@@ -52,7 +52,43 @@ impl ResourceType {
     /// of the value produced by `Resource::<T>::new_{own,borrow}`.
     pub fn host<T: 'static>() -> ResourceType {
         ResourceType {
-            kind: ResourceTypeKind::Host(TypeId::of::<T>()),
+            kind: ResourceTypeKind::Host {
+                id: TypeId::of::<T>(),
+                user_id: 0,
+            }
+        }
+    }
+
+    /// todo
+    pub fn user_id(self) -> Option<usize> {
+        match self.kind {
+            ResourceTypeKind::Host { id: _, user_id } => Some(user_id),
+            _ => None
+        }
+    }
+
+    /// Creates a new host resource type corresponding to `T`.
+    ///
+    /// Note that `T` is a mostly a phantom type parameter here. It does not
+    /// need to reflect the actual storage of the resource `T`. For example this
+    /// is valid:
+    ///
+    /// ```rust
+    /// use wasmtime::component::ResourceType;
+    ///
+    /// struct Foo;
+    ///
+    /// let ty = ResourceType::host::<Foo>();
+    /// ```
+    ///
+    /// A resource type of type `ResourceType::host::<T>()` will match the type
+    /// of the value produced by `Resource::<T>::new_{own,borrow}`.
+    pub fn host_user<T: 'static>(user_id: usize) -> ResourceType {
+        ResourceType {
+            kind: ResourceTypeKind::Host {
+                id: TypeId::of::<T>(),
+                user_id: user_id,
+            }
         }
     }
 
@@ -82,7 +118,10 @@ impl ResourceType {
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum ResourceTypeKind {
-    Host(TypeId),
+    Host {
+        id: TypeId,
+        user_id: usize,
+    },
     Guest {
         store: StoreId,
         // For now this is the `*mut ComponentInstance` pointer within the store
@@ -359,12 +398,16 @@ impl HostResourceIndex {
         HostResourceIndex(u64::from(idx) | (u64::from(gen) << 32))
     }
 
-    fn index(&self) -> u32 {
+    pub fn index(&self) -> u32 {
         u32::try_from(self.0 & 0xffffffff).unwrap()
     }
 
-    fn gen(&self) -> u32 {
+    pub fn gen(&self) -> u32 {
         u32::try_from(self.0 >> 32).unwrap()
+    }
+
+    pub fn as_u64(&self) -> u64 {
+        self.0
     }
 }
 
@@ -762,11 +805,12 @@ where
     pub fn try_from_resource_any(
         resource: ResourceAny,
         mut store: impl AsContextMut,
+        user_id: usize,
     ) -> Result<Self> {
         let store = store.as_context_mut();
         let mut tables = HostResourceTables::new_host(store.0);
         let ResourceAny { idx, ty, owned } = resource;
-        ensure!(ty == ResourceType::host::<T>(), "resource type mismatch");
+        ensure!(ty == ResourceType::host_user::<T>(user_id), "resource type mismatch");
         let (state, rep) = if owned {
             let rep = tables.host_resource_lift_own(idx)?;
             (AtomicResourceState::NOT_IN_TABLE, rep)
@@ -792,8 +836,8 @@ where
     }
 
     /// See [`ResourceAny::try_from_resource`]
-    pub fn try_into_resource_any(self, store: impl AsContextMut) -> Result<ResourceAny> {
-        ResourceAny::try_from_resource(self, store)
+    pub fn try_into_resource_any(self, store: impl AsContextMut, user_id: usize) -> Result<ResourceAny> {
+        ResourceAny::try_from_resource(self, store, user_id)
     }
 }
 
@@ -808,7 +852,7 @@ unsafe impl<T: 'static> ComponentType for Resource<T> {
             other => bail!("expected `own` or `borrow`, found `{}`", desc(other)),
         };
         match types.resource_type(resource).kind {
-            ResourceTypeKind::Host(id) if TypeId::of::<T>() == id => {}
+            ResourceTypeKind::Host {id, ..} if TypeId::of::<T>() == id => {}
             _ => bail!("resource type mismatch"),
         }
 
@@ -915,6 +959,7 @@ impl ResourceAny {
     pub fn try_from_resource<T: 'static>(
         resource: Resource<T>,
         mut store: impl AsContextMut,
+        user_id: usize,
     ) -> Result<Self> {
         let Resource { rep, state, .. } = resource;
         let store = store.as_context_mut();
@@ -931,14 +976,19 @@ impl ResourceAny {
         };
         Ok(Self {
             idx,
-            ty: ResourceType::host::<T>(),
+            ty: ResourceType::host_user::<T>(user_id),
             owned,
         })
     }
 
     /// See [`Resource::try_from_resource_any`]
-    pub fn try_into_resource<T: 'static>(self, store: impl AsContextMut) -> Result<Resource<T>> {
-        Resource::try_from_resource_any(self, store)
+    pub fn try_into_resource<T: 'static>(self, store: impl AsContextMut, user_id: usize) -> Result<Resource<T>> {
+        Resource::try_from_resource_any(self, store, user_id)
+    }
+
+    /// Returns the host resource index
+    pub fn idx(&self) -> HostResourceIndex {
+        self.idx
     }
 
     /// Returns the corresponding type associated with this resource, either a
@@ -1081,6 +1131,17 @@ impl ResourceAny {
             }
             _ => bad_type_info(),
         }
+    }
+
+    /// Attempts to return the rep for the ResourceAny without converting to Resource
+    pub fn rep(
+        self,
+        mut store: impl AsContextMut
+    ) -> Option<u32> {
+        let store = store.as_context_mut();
+        let mut tables = HostResourceTables::new_host(store.0);
+        let (idx, _) = tables.validate_host_index(self.idx, false).ok()?;
+        tables.tables.resource_rep(None, idx).ok()
     }
 }
 

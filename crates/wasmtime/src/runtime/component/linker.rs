@@ -3,8 +3,9 @@ use crate::component::instance::RuntimeImport;
 use crate::component::matching::{InstanceType, TypeChecker};
 use crate::component::types;
 use crate::component::{
-    Component, ComponentNamedList, Instance, InstancePre, Lift, Lower, ResourceType, Val,
+    Component, ComponentNamedList, Instance, InstancePre, Lift, Lower, ResourceType, Val, ComponentExportIndex,
 };
+use crate::runtime::store::StoreInner;
 use crate::hash_map::HashMap;
 use crate::prelude::*;
 use crate::{AsContextMut, Engine, Module, StoreContextMut};
@@ -14,6 +15,7 @@ use core::marker;
 use core::pin::Pin;
 use wasmtime_environ::component::{NameMap, NameMapIntern};
 use wasmtime_environ::PrimaryMap;
+use wasmtime_environ::component::TypeDef;
 
 /// A type used to instantiate [`Component`]s.
 ///
@@ -97,6 +99,7 @@ pub struct LinkerInstance<'a, T> {
     map: &'a mut NameMap<usize, Definition>,
     allow_shadowing: bool,
     _marker: marker::PhantomData<fn() -> T>,
+    debug_name: String,
 }
 
 #[derive(Clone)]
@@ -146,6 +149,7 @@ impl<T> Linker<T> {
             map: &mut self.map,
             allow_shadowing: self.allow_shadowing,
             _marker: self._marker,
+            debug_name: "root".to_owned(),
         }
     }
 
@@ -379,6 +383,7 @@ impl<T> LinkerInstance<'_, T> {
             map: self.map,
             allow_shadowing: self.allow_shadowing,
             _marker: self._marker,
+            debug_name: self.debug_name.clone(),
         }
     }
 
@@ -407,6 +412,55 @@ impl<T> LinkerInstance<'_, T> {
         Return: ComponentNamedList + Lower + 'static,
     {
         self.insert(name, Definition::Func(HostFunc::from_closure(func)))?;
+        Ok(())
+    }
+
+    fn define_instance_impl<'a, K, I>(&mut self, store: &'_ mut StoreInner<K>, component: &Component, instance: &Instance, exports: I, parent_instance_index: Option<&ComponentExportIndex>) -> Result<()>
+        where I: ExactSizeIterator<Item = (&'a str, types::ComponentItem)> + 'a,
+    {
+        for (export_name, export) in exports {
+            match export {
+                types::ComponentItem::ComponentFunc(_) | types::ComponentItem::CoreFunc(_) => {
+
+                    let (_, func_index) = component.export_index(parent_instance_index, export_name)
+                        .ok_or(anyhow!("Failed to find func index {}.", export_name))?;
+
+                    let func_name = export_name;
+                    let func = instance.get_func(&mut *store, &func_index)
+                        .ok_or(anyhow!("Failed to find func {} in instance", &func_name))?;
+                    self.func_new(&func_name, move |mut store, params, results| {
+                        func.call(&mut store, params, results)?;
+                        func.post_return(store)?;
+                        Ok(())
+                    })?;
+
+                },
+                types::ComponentItem::ComponentInstance(i) => {
+                    let (_, instance_index) = component.export_index(parent_instance_index, export_name)
+                        .ok_or(anyhow!("Failed to find instance index {}.", export_name))?;
+                    let engine = self.engine;
+                    self.instance(export_name)? .define_instance_impl(
+                        &mut *store,
+                        component,
+                        instance,
+                        i.exports(engine),
+                        Some(&instance_index))?;
+                    continue;
+                }
+                _ => {
+                    continue;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// TODO: needs more words and examples
+    pub fn define_instance<K>(&mut self, store: &'_ mut StoreInner<K>, component: &Component, instance: &Instance) -> Result<()>
+    {
+        self.define_instance_impl(
+            store, component, instance, component.component_type().exports(self.engine), None)?;
         Ok(())
     }
 
@@ -660,9 +714,29 @@ impl<T> LinkerInstance<'_, T> {
         self.as_mut().into_instance(name)
     }
 
+    /// Returns existing instance with the given name
+    pub fn get_instance(mut self, name: &str) -> Option<Self> {
+        let k = self.strings.intern(name);
+        match self.map.raw_get_mut(&k) {
+            Some(def) => {
+                self.map = match def {
+                    Definition::Instance(map) => map,
+                    _ => unreachable!(),
+                };
+                self.path.truncate(self.path_len);
+                self.path.push(k);
+                self.path_len += 1;
+                return Some(self)
+            }
+
+            None => None
+        }
+    }
+
     /// Same as [`LinkerInstance::instance`] except with different lifetime
     /// parameters.
     pub fn into_instance(mut self, name: &str) -> Result<Self> {
+        self.debug_name = format!("{}/{}", self.debug_name, name);
         let name = self.insert(name, Definition::Instance(NameMap::default()))?;
         self.map = match self.map.raw_get_mut(&name) {
             Some(Definition::Instance(map)) => map,
@@ -701,4 +775,43 @@ impl NameMapIntern for Strings {
     fn lookup(&self, string: &str) -> Option<usize> {
         self.string2idx.get(string).cloned()
     }
+}
+
+fn iter_imports_rec<'a, I, F>(component: &Component, imports: I, path: String, cb: F) -> Result<()>
+    where I: ExactSizeIterator<Item = (&'a String, &'a TypeDef)> + 'a,
+        F: Fn(&str, &str, &TypeDef) + Copy
+{
+    for (import_name, import) in imports {
+        match import {
+            TypeDef::ComponentInstance(type_index) => {
+                let instance_typ = &component.types()[*type_index];
+                let sub_path = if path.len() == 0 {
+                    import_name.to_owned()
+                } else {
+                    format!("{}/{}", path, import_name)
+                };
+
+                iter_imports_rec(
+                    component,
+                    instance_typ.exports.iter(), sub_path, cb)?;
+                continue;
+            }
+
+            _ => {
+                cb(&path, import_name, import);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Iterates over every import of the given component, recursing into component instances,
+/// and calls `cb` for every import.
+pub fn iter_imports<F>(component: &Component, cb: F) -> Result<()>
+    where F: Fn(&str, &str, &TypeDef) + Copy
+{
+    let env_component = component.env_component();
+    iter_imports_rec(component, env_component.import_types.iter().map(|(_, (n, t))| (n, t)), "".to_owned(), cb)?;
+    Ok(())
 }
